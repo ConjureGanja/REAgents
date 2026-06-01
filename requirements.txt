@@ -1,0 +1,47 @@
+# Resident Evil AI Agent — Dependencies
+# Python 3.11.x recommended for full compatibility
+#
+# GPU SETUP (do this FIRST, before pip install -r requirements.txt):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# Then install everything else:
+#   pip install -r requirements.txt
+
+# ── Vision & Perception ───────────────────────────────────────────────────────
+mss>=9.0.1
+ultralytics>=8.3.0               # YOLO11 object detection
+easyocr>=1.7.1                   # HUD OCR (ammo counter)
+opencv-python>=4.10.0.84
+numpy>=1.26.0,<2.0.0             # <2.0 required by several vision libs
+
+# ── Reinforcement Learning ────────────────────────────────────────────────────
+torch>=2.3.0                     # See GPU setup note above
+stable-baselines3>=2.3.2         # PPO and training infrastructure
+sb3-contrib>=2.3.0               # RecurrentPPO (LSTM policy)
+shimmy>=2.0.0                    # Gymnasium compatibility shim
+gymnasium>=0.29.1
+
+# ── LLM (Claude only — only ANTHROPIC_API_KEY required) ──────────────────────
+anthropic>=0.40.0                # Claude client (vision-capable)
+python-dotenv>=1.0.1             # Loads .env file for API keys
+tenacity>=8.5.0                  # Retry logic for transient API errors
+
+# Optional (no longer used by default but kept for future multi-model experiments):
+# openai>=1.40.0                 # GPT-4o / Grok via xAI OpenAI-compatible API
+# langgraph>=0.2.28              # LangGraph workflow orchestration
+
+# ── Database & Storage ────────────────────────────────────────────────────────
+# memory.py uses stdlib sqlite3 — no extra package needed
+
+# ── Dashboard & Visualisation ─────────────────────────────────────────────────
+gradio>=5.1.0
+plotly>=5.24.1
+tensorboard>=2.17.0              # View training curves: tensorboard --logdir logs/tensorboard
+
+# ── Config & Utilities ────────────────────────────────────────────────────────
+pyyaml>=6.0.1
+pillow>=10.4.0                   # Image encode/decode for API payloads
+
+# ── Input Control (Windows only) ─────────────────────────────────────────────
+pydirectinput>=1.0.4             # DirectX-compatible SendInput (bypasses Win32 PostMessage)
+pyautogui>=0.9.54                # Used only for failsafe mouse position polling

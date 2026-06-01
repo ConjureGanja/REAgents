@@ -1,0 +1,73 @@
+Resident Evil AI Agent Idea
+
+    ---
+    Architecture Overview
+
+    Core Approach: Vision-Based RL + LLM Hybrid
+
+    Pure reinforcement learning alone struggles with Resident Evil's complexity (sparse rewards, long-horizon planning, inventory management). The
+    best modern approach combines both:
+
+    - Vision model (screenshot → game state understanding)
+    - RL agent (learns actions over time)
+    - LLM "brain" (high-level reasoning, puzzle solving, inventory decisions)
+    - Live dashboard (everything observable in real time)
+
+    ---
+    Stack Recommendation
+
+    Screen Capture & Control
+
+    - mss — ultra-fast screen capture (60fps+)
+    - pyautogui or pydirectinput — keyboard/mouse control (pydirectinput is better for DirectX games)
+    - win32api — lower-level Windows input if needed
+
+    Game State Perception
+
+    - YOLOv8 — real-time object detection (enemies, items, doors)
+    - OCR (Tesseract / EasyOCR) — read health, ammo, inventory text
+    - Template matching (OpenCV) — detect UI states, map icons
+    - Consider fine-tuning a small vision model on RE-specific screenshots
+
+    The Agent Brain
+
+    Option A — Pure RL:
+    - Stable-Baselines3 with PPO or SAC
+    - Reward shaping: +health items collected, +enemies killed, +new rooms explored, -damage taken, -death
+    - Observation space: downscaled screenshot (84×84 grayscale) + structured state vector
+
+    Option B — LLM-Guided (recommended for RE specifically):
+    - Use Claude or GPT-4V to interpret screenshots and make high-level decisions ("go through the door", "use herb", "avoid this enemy")
+    - RL handles low-level navigation and combat reflexes
+    - LLM handles puzzles, inventory optimization, route planning
+
+    Memory System
+
+    - Short-term: last N frames + recent events buffer
+    - Long-term: graph of explored rooms, known item locations, puzzle states (store in SQLite or a simple JSON knowledge base)
+    - The agent literally builds a map as it plays
+
+    ---
+    Live Dashboard (the fun part)
+
+    Use Streamlit or Gradio for quick setup, or Dash for more control:
+    ┌─────────────────┬──────────────────┬─────────────────┐
+    │   LIVE FEED     │   AGENT THOUGHTS │   METRICS       │
+    │  (game screen)  │  - Current goal  │  - Reward curve │
+    │                 │  - Threats seen  │  - Rooms visited│
+    │                 │  - Inventory     │  - Deaths       │
+    │                 │  - Confidence    │  - Items found  │
+    └─────────────────┴──────────────────┴─────────────────┘
+             ┌──────────────────────────────┐
+             │     KNOWLEDGE MAP                               	   │
+             │  (rooms discovered, items,   				   │
+             │   enemy positions, events)   				   │
+             └──────────────────────────────┘
+
+    Libraries:
+    - plotly — live updating reward/metric charts
+    - opencv + websockets — stream the annotated game feed
+    - Custom overlay drawn on captured frames showing bounding boxes, agent attention, detected objects
+
+    ---
+    Key Implementation Challenges & Solutions

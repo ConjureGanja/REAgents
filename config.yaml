@@ -1,0 +1,252 @@
+# Resident Evil AI Agent — Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Edit this file to tune the agent without touching any Python code.
+# All file paths are relative to the project root (where main.py lives).
+
+game_settings:
+  title:                  "Resident Evil Agent"
+  window_mode:            "Borderless Windowed"
+  target_resolution:      [1920, 1080]
+  monitor_index:          2          # 1 = primary monitor, 2 = secondary
+  window_title_substring: "RESIDENT EVIL 4"
+  capture_region:
+    top:    0
+    left:   0
+    width:  1920
+    height: 1080
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PERCEPTION
+# ─────────────────────────────────────────────────────────────────────────────
+perception:
+  yolo_model:            "yolo11n.pt"
+  confidence_threshold:  0.40
+
+  # Pixel coords [y1, x1, y2, x2] in full 1920×1080 space.
+  # IMPORTANT: these must be calibrated to your monitor layout.
+  # Run `python perception.py` while the game is running to see the boxes.
+  ocr_regions:
+    ammo: [900, 1550, 980, 1900]     # Ammo counter — bottom-right HUD
+
+  health_circle: [880, 80, 980, 180] # Health ring — top-left HUD
+  health_colors:
+    fine:    [[35, 50, 50], [85, 255, 255]]    # Green  — full / good health
+    caution: [[10, 50, 50], [30, 255, 255]]    # Orange — ~50% health
+    danger:  [[0,  50, 50], [10, 255, 255]]    # Red    — critical health
+
+  template_match_threshold: 0.85
+  health_smooth_window:     5        # Rolling average frames for health reading
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RL HYPERPARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+# ALGORITHM CHOICE
+#   "RecurrentPPO" — primary choice. Uses LSTM for temporal memory.
+#                    Best for RE4 because the agent needs to remember events
+#                    from ~2-3 seconds ago (enemy heard but not seen, etc.)
+#   "PPO"          — faster per step, no LSTM. Use frame_stack for memory.
+#
+# FRAME STACKING (frame_stack)
+#   Concatenates the last N frames along the channel axis.
+#   This gives the CNN motion information (where enemies were moving).
+#   Default 4 = a ~320ms history window at action_hold_seconds=0.08.
+#
+# OBSERVATION SIZE (obs_frame_size)
+#   Pixels fed to the CNN after downscaling the captured frame.
+#   Larger = more detail but more VRAM. 84×84 is the Atari standard.
+#   128×128 is significantly better for RE4's rich environment.
+#
+# REWARD NORMALISATION (use_vec_normalize)
+#   Standardises rewards to mean=0 std=1 using a running average.
+#   Strongly recommended — prevents large reward spikes from destabilising
+#   training.
+rl_hyperparameters:
+  algorithm:           "RecurrentPPO"  # "PPO" or "RecurrentPPO"
+
+  # Observation preprocessing
+  obs_frame_size:      [84, 84]        # Increase to [128, 128] for more detail
+  grayscale:           false           # false = RGB (3ch, better for RE4 colour cues)
+  frame_stack:         4               # Stack N frames (temporal motion cues)
+
+  # RecurrentPPO LSTM settings (ignored for plain PPO)
+  lstm_hidden_size:    256             # LSTM hidden state size
+  n_lstm_layers:       1               # Number of stacked LSTM layers
+
+  # Feature extractor output size (matches Impala CNN → policy head)
+  features_dim:        512
+
+  # Core PPO hyperparameters — tuned for visual RE4 gameplay
+  learning_rate:       0.00025         # Standard PPO value
+  n_steps:             512             # Rollout length before policy update
+                                       # (lower = more frequent updates = better for village)
+  batch_size:          128             # Mini-batch size during policy update
+  n_epochs:            4               # How many passes over each rollout
+  gamma:               0.99            # Discount factor (future reward weight)
+  gae_lambda:          0.95            # GAE smoothing parameter
+  clip_range:          0.2             # PPO clip (don't change too much per update)
+  ent_coef:            0.01            # Entropy bonus (keeps policy exploring)
+  max_grad_norm:       0.5             # Gradient clipping (training stability)
+
+  # Action timing
+  action_hold_seconds: 0.08            # How long each action is held (~12 Hz decision rate)
+
+  # Reward normalisation
+  use_vec_normalize:   true            # Highly recommended for training stability
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM SETTINGS  (Claude only — requires ANTHROPIC_API_KEY in .env)
+# ─────────────────────────────────────────────────────────────────────────────
+# The LLM advisor runs in a background thread every `llm_every_n_steps` steps.
+# It looks at the current game frame and HUD data, then outputs:
+#   - A vision description (what's on screen)
+#   - A strategic plan (what to do over the next 30 s)
+#   - A tactical decision (immediate action recommendation)
+#   - An optional action override (hard-steer the RL agent)
+#   - An objective phrase (used for reward shaping)
+#
+# To disable LLM entirely: run with --no-llm flag
+llm_settings:
+  claude_model:         "claude-sonnet-4-6"   # Vision-capable Claude model
+  claude_max_tokens:    600
+  temperature:          0.5             # Lower = more deterministic; 0.5 = balanced
+  llm_every_n_steps:    60              # Consult every 60 RL steps (~5 s at 12 Hz)
+  call_cooldown_seconds: 5.0            # Minimum gap between API calls (cost control)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STORAGE
+# ─────────────────────────────────────────────────────────────────────────────
+storage:
+  db_path:          "data/re_agent_memory.db"
+  checkpoint_dir:   "models/checkpoints/"
+  log_dir:          "logs/"
+  tensorboard_dir:  "logs/tensorboard/"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EPISODE RESET (Load Game navigation)
+# ─────────────────────────────────────────────────────────────────────────────
+# RE4 Remake has no quick-load shortcut. This config navigates the pause menu:
+#   ESC → pause menu → DOWN (nav_down_count times) → F (select Load Game)
+#       → F (select most-recent save) → F (confirm load dialog)
+#
+# If your menu layout has different items above "Load Game" (e.g. a DLC adds
+# an entry), increase nav_down_count.
+reset:
+  nav_down_count:    1     # Presses of Down arrow to reach "Load Game"
+  confirm_key:       "f"   # Key used to select items (default interact key)
+  menu_open_wait:    1.5   # Seconds after ESC for pause menu to render
+  nav_between_wait:  0.4   # Seconds between arrow-key navigation presses
+  select_wait:       1.0   # Seconds after selecting "Load Game"
+  confirm_wait:      0.5   # Seconds between confirmation presses
+  loading_wait:      8.0   # Seconds after final confirm for the game to load
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAINING SCHEDULE
+# ─────────────────────────────────────────────────────────────────────────────
+training:
+  total_timesteps:  1_000_000
+  checkpoint_freq:  50_000      # Save .zip checkpoint every N steps
+  eval_freq:        10_000      # Run evaluation episode every N steps
+  eval_episodes:    3
+  resume_path:      null        # Set to "models/checkpoints/re_agent_final.zip" to resume
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CURRICULUM
+# ─────────────────────────────────────────────────────────────────────────────
+# Three stages — each re-weights the reward function:
+#
+#  exploration  (0–200k steps)
+#    Focus: survive and explore the village. Learn to move, avoid damage,
+#    and interact with the environment. Combat is secondary.
+#
+#  combat       (200k–600k steps)
+#    Focus: fight efficiently. Learn aimed shots, dodge, kill enemies without
+#    wasting ammo.
+#
+#  completion   (600k–1M steps)
+#    Focus: complete objectives. Use LLM guidance, pick up key items, use
+#    resources wisely.
+#
+# The agent starts in the village siege (Chapter 1), which is perfect for
+# the exploration stage — lots of enemies, open space, and a clear objective
+# (reach the house with the shotgun, survive until the bell rings).
+# ─────────────────────────────────────────────────────────────────────────────
+# SIMULATION MODE  (sim_main.py / sim_environment.py)
+# ─────────────────────────────────────────────────────────────────────────────
+# Run `python sim_main.py` instead of `python main.py` to train entirely in an
+# abstract Python simulation — no game window required.
+#
+# WHY SIMULATION?
+#   Real game training is limited to ~12 steps/second (one action every 80 ms).
+#   With 8 parallel workers, the simulation runs ~80,000 steps/second —
+#   roughly 6,000x faster.  What would take a week of real-game training
+#   completes in 1-2 hours in simulation.
+#
+#   Analogy: flight simulators.  A pilot logs hundreds of hours in simulation
+#   before touching a real aircraft.  The simulation is a safe, fast, cheap
+#   proxy for reality.  Once the agent is competent here, you can fine-tune
+#   on the real game with a head-start policy.
+#
+# MAP (2D top-down, 50×50 world units)
+#   Obstacles:  barn (top-right), house (top-left), well (centre), perimeter fence
+#   Player start: centre-south  (25, 42)
+#   Enemy waves:  3 waves of 8 enemies each (24 total per episode)
+#   Episode ends: player death  OR  600 survival steps (bell rings)
+#
+# OBSERVATION
+#   Same structure as the real env: Dict{"frame": (84,84,12), "hud": (7,)}
+#   "frame" is a stacked top-down rendering rendered in pure numpy — no game, no
+#   screen capture, no OCR.  The CNN learns from these symbolic pixel views.
+#
+# TRANSFER
+#   After sim training, the saved .zip checkpoint can be loaded directly into
+#   main.py with --resume  to fine-tune on the real game.  The observation space
+#   is identical so the policy weights transfer without any changes.
+simulation:
+  n_workers:          8        # Parallel SubprocVecEnv workers (one process each)
+  map_width:          50       # World units (arbitrary scale)
+  map_height:         50
+  max_episode_steps:  600      # Steps before the "bell rings" and episode succeeds
+  player_speed:       0.6      # Units moved per step (regular movement)
+  sprint_multiplier:  1.8      # Speed boost when evasion action = sprint
+  dodge_cooldown:     8        # Steps between dodge rolls
+  enemy_speed:        0.28     # Enemy movement units per step (patrol)
+  enemy_chase_speed:  0.40     # Enemy speed when chasing player
+  enemy_detection_range: 14.0  # Units — enemy "sees" player within this radius
+  enemy_attack_range:    1.8   # Units — enemy deals damage within this radius
+  enemy_attack_damage:   12.0  # Health points lost per enemy hit (out of 100)
+  enemy_attack_cooldown: 15    # Steps between enemy attacks
+  shoot_range:        20.0     # Maximum effective shooting distance
+  shoot_cone_deg:     18.0     # Half-angle of the aim cone in degrees
+  ammo_start_clip:    15       # Starting pistol magazine
+  ammo_start_reserve: 50       # Starting reserve ammo
+  ammo_pickup_amount: 10       # Ammo gained from each pickup
+  enemy_waves:        3        # Number of waves (each wave = 8 enemies)
+  wave_trigger_kills: 5        # Kill N enemies from current wave to trigger next
+  snapshot_every_n:   50       # Steps between worker snapshots sent to dashboard
+                               # (lower = smoother visualisation, higher = faster)
+
+curriculum:
+  enabled:        true
+  initial_stage:  "exploration"
+  stages:
+    exploration:
+      until_timestep: 200_000
+      reward_weights:
+        survival:     0.4
+        exploration:  2.0
+        combat:       1.5
+        objective:    1.0
+    combat:
+      until_timestep: 600_000
+      reward_weights:
+        survival:     0.2
+        exploration:  0.5
+        combat:       4.0
+        objective:    1.5
+    completion:
+      until_timestep: 1_000_000
+      reward_weights:
+        survival:     0.2
+        exploration:  0.3
+        combat:       2.5
+        objective:    3.0

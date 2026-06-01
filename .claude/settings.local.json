@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(file /v/AI-ML/REAgents/RE_AI_Agent_Spec.*)"
+    ]
+  }
+}
