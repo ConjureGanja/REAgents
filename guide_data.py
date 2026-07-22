@@ -6,13 +6,13 @@ WALKTHROUGH: dict = {
         "objective": "Survive the Village Square siege. The bell will ring after ~3 minutes; all enemies retreat automatically.",
         "optimal_strategy": (
             "PRIORITY 1 — Get the Shotgun: Run north through the village to the two-storey farmhouse. "
-            "Climb the ladder inside; the W-870 shotgun is on the wall upstairs. Do NOT fight on the way — sprint past enemies. "
+            "Climb the ladder or stairs inside; the W-870 shotgun is on the wall upstairs. Do NOT fight on the way — sprint past enemies. "
             "PRIORITY 2 — Survive Chainsaw Man (Dr. Salvador): He appears from the south. Keep maximum distance. "
             "If cornered, sprint to a different area. Do NOT waste handgun ammo on him (he regenerates). "
             "Use the shotgun at close range for a knockback. "
             "PRIORITY 3 — Use the environment: windows upstairs allow you to jump out and break line-of-sight. "
             "The well area (centre of village) has a yellow herb — grab it but don't stop moving. "
-            "PRIORITY 4 — Knife parry: Tap the knife button (RMB then LMB quickly) when an enemy lunges — "
+            "PRIORITY 4 — Knife parry: Tap the knife button (LBumper then RBumper quickly) when an enemy lunges — "
             "this deflects the attack for zero damage. Saves enormous ammo against the mob. "
             "Once the bell rings, ALL enemies retreat. Stop fighting and explore for items."
         ),
@@ -187,9 +187,9 @@ WALKTHROUGH: dict = {
 }
 
 GENERAL_TIPS: list[str] = [
-    "Knife parrying saves enormous ammo — tap knife (RMB+LMB quickly) at the last second before a melee hit. Works on almost every enemy melee attack.",
-    "Shoot enemy LEGS to trip them, then run up and press melee (F) for a free kick — zero ammo cost, significant damage.",
-    "Sprint (Shift) away from crowds rather than shooting — conserve ammo for the shotgun house run.",
+    "Knife parrying saves enormous ammo — tap knife (LB+RB quickly) at the last second before a melee hit. Works on almost every enemy melee attack.",
+    "Shoot enemy LEGS to trip them, then run up and press melee (A or X) for a free kick — zero ammo cost, significant damage.",
+    "Sprint (L31) away from crowds rather than shooting — conserve ammo for the shotgun house run.",
     "Combine treasures with matching coloured gems (5 gems = maximum value multiplier — never sell unmatched gems).",
     "Flash grenades instantly kill exposed Plagas parasites — extremely efficient (one grenade = multiple kills).",
     "Always buy a Rocket Launcher before Verdugo and Saddler fights; saves minutes of frustrating combat.",

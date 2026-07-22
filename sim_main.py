@@ -120,43 +120,53 @@ def _training_thread(
             cfg["training"]["total_timesteps"] = timestep_override
             log.info("Total timesteps overridden → %d", timestep_override)
 
-        # Write the patched config to a temp file so SimRETrainer can read it
-        import tempfile, json
+        # Write the patched config to a temp file so SimRETrainer can read it.
+        # FIXES vs the old version:
+        #   1. dir="." littered the PROJECT ROOT with tmpXXXX.yaml files
+        #      (you had two of them checked into the repo) — now we use the
+        #      system temp directory.
+        #   2. Cleanup only ran on a clean exit; a crash or Stop mid-training
+        #      skipped the unlink and leaked the file.  try/finally guarantees
+        #      cleanup on every path.
+        # Analogy: scratch paper belongs in the recycling bin by the desk, not
+        # stapled into the report — and you bin it even if the meeting ends early.
+        import tempfile
         tmp_cfg = config_path  # Default: use original file if no overrides
         if worker_override is not None or timestep_override is not None:
             with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".yaml", delete=False, dir="."
+                mode="w", suffix=".yaml", delete=False
             ) as tf:
                 yaml.dump(cfg, tf)
                 tmp_cfg = tf.name
             log.debug("Patched config written to %s", tmp_cfg)
 
-        trainer = SimRETrainer(tmp_cfg, shared, memory, consultant)
-        trainer.build()
+        try:
+            trainer = SimRETrainer(tmp_cfg, shared, memory, consultant)
+            trainer.build()
 
-        if resume_path:
-            trainer.load_checkpoint(resume_path)
+            if resume_path:
+                trainer.load_checkpoint(resume_path)
 
-        n_workers = cfg.get("simulation", {}).get("n_workers", 8)
-        log.info(
-            "Simulation trainer ready (%d workers) — press ▶ Start in dashboard.",
-            n_workers,
-        )
+            n_workers = cfg.get("simulation", {}).get("n_workers", 8)
+            log.info(
+                "Simulation trainer ready (%d workers) — press ▶ Start in dashboard.",
+                n_workers,
+            )
 
-        # Wait for dashboard Start button (sets is_training=True)
-        while not shared.is_training and not shared.stop_requested:
-            time.sleep(0.5)
+            # Wait for dashboard Start button (sets is_training=True)
+            while not shared.is_training and not shared.stop_requested:
+                time.sleep(0.5)
 
-        if not shared.stop_requested:
-            log.info("Simulation training started.")
-            trainer.train()
-
-        # Clean up temp config if created
-        if tmp_cfg != config_path:
-            try:
-                os.unlink(tmp_cfg)
-            except OSError:
-                pass
+            if not shared.stop_requested:
+                log.info("Simulation training started.")
+                trainer.train()
+        finally:
+            # Clean up temp config if created — runs on success, crash, or stop.
+            if tmp_cfg != config_path:
+                try:
+                    os.unlink(tmp_cfg)
+                except OSError:
+                    pass
 
     except Exception as exc:
         log.exception("Simulation training thread crashed: %s", exc)

@@ -174,7 +174,7 @@ class MemorySystem:
             step=step,
             action=action,
             reward=reward,
-            health_pct=float(hud.get("health_pct", 1.0)),
+            health_pct=float(hud["health_pct"]) if hud.get("health_pct") is not None else -1.0,
             ammo_clip=int(hud.get("ammo_clip", 0) or 0),
             ammo_res=int(hud.get("ammo_res", 0) or 0),
             enemy_count=hud.get("enemy_count", 0),

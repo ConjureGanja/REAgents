@@ -75,7 +75,16 @@ MAP_H: float = 50.0
 # but there's no art, just rectangles.
 OBSTACLES: List[Tuple[float, float, float, float]] = [
     (3.0,  3.0, 15.0, 18.0),   # House (top-left)
-    (34.0, 3.0, 47.0, 18.0),   # Barn  (top-right) — contains shotgun
+    # Barn (top-right) — WALLS ONLY so the interior is walkable and the shotgun
+    # at (41,10) is reachable.  Previously the barn was one solid block, which
+    # meant the player was clipped ~6 units outside it and could NEVER collect
+    # the shotgun or trigger barn_visited — the episode's main objective was
+    # impossible.  Now it's a room with a south doorway gap at x∈[39,42].
+    (34.0,  3.0, 47.0,  4.5),  # Barn north wall
+    (34.0,  3.0, 35.5, 18.0),  # Barn west wall
+    (45.5,  3.0, 47.0, 18.0),  # Barn east wall
+    (34.0, 16.5, 39.0, 18.0),  # Barn south wall (left of door)
+    (42.0, 16.5, 47.0, 18.0),  # Barn south wall (right of door)
     (21.0, 21.0, 29.0, 29.0),  # Well  (centre)
     # Perimeter fence segments (thin, treated as solid)
     (0.0,  0.0, 50.0,  1.5),   # North wall
@@ -343,6 +352,13 @@ class SimGameState:
         speed = self.player_speed
         if ev == 2:   # Sprint
             speed *= self.sprint_mult
+        # Aiming ROOTS you in RE4 Remake — Leon can only shuffle while the gun
+        # is raised.  Without this cost the sim policy learns to hold aim+shoot
+        # permanently (it's free), and that habit transfers to the real game as
+        # "frozen Leon".  Matching the physics makes constant-aim genuinely
+        # expensive, so the policy learns to aim only when it wants to fire.
+        if self.player_aiming:
+            speed *= float(self._cfg.get("aim_move_mult", 0.3))
 
         # Is this step a dodge?  Dodge = brief i-frame burst in a direction.
         is_dodge = (ev == 1 and self.dodge_timer <= 0)
@@ -368,7 +384,9 @@ class SimGameState:
             dx, dy = _MV_DIR[mv]
             new_x = self.player_x + dx * speed
             new_y = self.player_y + dy * speed
-            self.player_x, self.player_y = self._clip_to_map(new_x, new_y)
+            self.player_x, self.player_y = self._try_move(
+                self.player_x, self.player_y, new_x, new_y
+            )
 
         # ── 4. Interact: collect items ────────────────────────────────────────
         if inter == 1:
@@ -454,10 +472,29 @@ class SimGameState:
         """
         Return a detections list in the format expected by environment.py.
         Each entry mimics a YOLO detection dict (label, confidence, bbox).
+
+        VISION-LIMITED, like the real game: YOLO only sees enemies that are ON
+        SCREEN, so the sim only reports enemies within `vision_range` AND
+        within a ~140° cone around the player's facing direction.  The old
+        omniscient version returned every living enemy map-wide, which (a) fed
+        the policy an enemy count the real game can never produce (sim-to-real
+        distribution shift in the HUD vector) and (b) made "no enemy in sight"
+        essentially never true, neutering the aim-at-nothing penalty.
         """
+        vision_range = float(self._cfg.get("vision_range", 22.0))
+        half_fov     = math.radians(float(self._cfg.get("vision_fov_deg", 140.0)) / 2.0)
         out = []
         for enemy in self.enemies:
             if enemy.state in (EnemyState.DEAD,):
+                continue
+            dx, dy = enemy.x - self.player_x, enemy.y - self.player_y
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist > vision_range:
+                continue
+            ang_diff = abs(
+                (math.atan2(dy, dx) - self.player_dir + math.pi) % (2 * math.pi) - math.pi
+            )
+            if ang_diff > half_fov:
                 continue
             out.append({
                 "label": "enemy",
@@ -674,9 +711,9 @@ class SimGameState:
         enemy.patrol_timer -= 1
         nx = enemy.x + math.cos(enemy.patrol_angle) * self.enemy_speed
         ny = enemy.y + math.sin(enemy.patrol_angle) * self.enemy_speed
-        new_x, new_y = self._clip_to_map(nx, ny)
+        new_x, new_y = self._try_move(enemy.x, enemy.y, nx, ny)
 
-        # If clipped (hit an obstacle), change direction
+        # If blocked (hit an obstacle), change direction
         if abs(new_x - nx) > 0.01 or abs(new_y - ny) > 0.01:
             enemy.patrol_angle = self._rng.uniform(0, 2 * math.pi)
             enemy.patrol_timer = 0
@@ -691,7 +728,7 @@ class SimGameState:
         nx, ny = dx / dist, dy / dist
         new_x = enemy.x + nx * speed
         new_y = enemy.y + ny * speed
-        enemy.x, enemy.y = self._clip_to_map(new_x, new_y)
+        enemy.x, enemy.y = self._try_move(enemy.x, enemy.y, new_x, new_y)
 
     def _do_shoot(self) -> int:
         """
@@ -782,31 +819,51 @@ class SimGameState:
                     self.shotgun_this_step = True
                 self.items_this_step += 1
 
-    def _clip_to_map(self, x: float, y: float) -> Tuple[float, float]:
-        """
-        Clamp a position to map bounds and push it out of any obstacle.
-
-        Analogy: a bumper in pinball — when the ball (entity) hits a wall,
-        it bounces back to the edge rather than passing through.
-        """
-        x = max(0.3, min(MAP_W - 0.3, x))
-        y = max(0.3, min(MAP_H - 0.3, y))
-
-        # Check each obstacle — push out of whichever edge is closest
+    @staticmethod
+    def _is_free(x: float, y: float) -> bool:
+        """True if (x, y) is inside map bounds and outside every obstacle."""
+        if not (0.3 <= x <= MAP_W - 0.3 and 0.3 <= y <= MAP_H - 0.3):
+            return False
         for (x1, y1, x2, y2) in OBSTACLES:
             if x1 <= x <= x2 and y1 <= y <= y2:
-                # Distances to each of the four edges
-                d = [x - x1, x2 - x, y - y1, y2 - y]
-                min_idx = d.index(min(d))
-                if min_idx == 0:
-                    x = x1 - 0.2
-                elif min_idx == 1:
-                    x = x2 + 0.2
-                elif min_idx == 2:
-                    y = y1 - 0.2
-                else:
-                    y = y2 + 0.2
-        return x, y
+                return False
+        return True
+
+    def _try_move(self, old_x: float, old_y: float,
+                  new_x: float, new_y: float) -> Tuple[float, float]:
+        """
+        Axis-separated slide movement with REJECTING collision.
+
+        The old `_clip_to_map` "push out of the nearest edge" logic could push
+        an entity THROUGH a perimeter wall to a position OUTSIDE the map
+        (e.g. x=50.2 beyond the east wall).  The trained policy discovered
+        this and camped out-of-bounds where enemies couldn't reach — an
+        exploit, not gameplay.  Rejecting invalid moves (with axis slide so
+        walls can still be skimmed along) makes wall-embedding impossible.
+        """
+        if self._is_free(new_x, new_y):
+            return new_x, new_y
+        if self._is_free(new_x, old_y):      # slide along x
+            return new_x, old_y
+        if self._is_free(old_x, new_y):      # slide along y
+            return old_x, new_y
+        return old_x, old_y                  # fully blocked — stay put
+
+    def _free_spawn(self, x: float, y: float) -> Tuple[float, float]:
+        """Nudge a spawn position toward the map centre until it's collision-free."""
+        for _ in range(60):
+            if self._is_free(x, y):
+                return x, y
+            cx, cy = MAP_W / 2.0, MAP_H / 2.0
+            dx, dy = cx - x, cy - y
+            dist = max(0.001, math.sqrt(dx * dx + dy * dy))
+            x += dx / dist
+            y += dy / dist
+        return MAP_W / 2.0, MAP_H / 2.0
+
+    def _clip_to_map(self, x: float, y: float) -> Tuple[float, float]:
+        """Legacy alias kept for spawn call-sites — resolves to a free position."""
+        return self._free_spawn(x, y)
 
     @staticmethod
     def _dist(ax: float, ay: float, bx: float, by: float) -> float:

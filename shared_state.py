@@ -80,7 +80,7 @@ class SharedState:
     # and auto-resumes (paused=False) when the game regains focus.
     # Set to False if you prefer to manage pausing manually.
     paused: bool = False
-    auto_pause_on_focus_loss: bool = True
+    auto_pause_on_focus_loss: bool = False  # gamepad inputs don't need window focus
 
     # ── Simulation-mode fields (populated by sim_trainer.py) ──────────────────
     #
@@ -110,6 +110,19 @@ class SharedState:
             for key, value in kwargs.items():
                 if hasattr(self, key):
                     setattr(self, key, value)
+                else:
+                    # A typo'd field name used to vanish silently — e.g.
+                    # update(deth_count=3) would "succeed" while the dashboard
+                    # kept showing stale data, with zero breadcrumbs.  Log it
+                    # loudly (but don't raise: a monitoring typo should never
+                    # crash a training run mid-episode).
+                    # Analogy: mail addressed to a name not on the building's
+                    # directory — better the doorman tells you than quietly
+                    # dropping it in the shredder.
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "SharedState.update: unknown field %r ignored (typo?)", key
+                    )
 
     def get_snapshot(self) -> Dict[str, Any]:
         """Return a deep-enough copy for the dashboard to render safely."""

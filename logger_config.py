@@ -15,6 +15,15 @@ def setup_logging(log_dir: str = "logs", level: int = logging.INFO) -> None:
         root.handlers[0].setLevel(level)
         return
 
+    # Windows consoles default to cp1252, which can't encode characters like
+    # "→" and crashes the logging StreamHandler. Force the stdout stream to
+    # UTF-8 and never hard-fail on an unmappable char.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        # Stream doesn't support reconfigure (e.g. already wrapped/redirected).
+        pass
+
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     log_path = Path(log_dir) / "re_agent.log"
 

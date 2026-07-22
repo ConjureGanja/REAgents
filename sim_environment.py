@@ -39,15 +39,20 @@ import yaml
 from gymnasium import spaces
 import gymnasium as gym
 
-from sim_game_state import SimGameState, EnemyState
+from sim_game_state import SimGameState, EnemyState, MAP_W, MAP_H
 
 logger = logging.getLogger(__name__)
 
-# ── Curriculum reward weights (identical to environment.py) ───────────────────
+# ── Curriculum reward weights ─────────────────────────────────────────────────
+# Gentle multipliers — survival and objective always count fully; we only shift
+# emphasis between exploration (navigation) and combat across stages.  The old
+# weights (exploration 2.5) let a per-step movement bonus dominate every other
+# signal, so the policy learned to wiggle in place instead of pursuing the
+# shotgun/bell.  Keeping the spread small lets the actual mission rewards lead.
 _CURRICULUM_WEIGHTS: Dict[str, Dict[str, float]] = {
-    "exploration": {"survival": 0.6, "exploration": 2.5, "combat": 0.4, "objective": 1.0},
-    "combat":      {"survival": 0.4, "exploration": 0.5, "combat": 2.5, "objective": 1.5},
-    "completion":  {"survival": 0.3, "exploration": 0.3, "combat": 1.5, "objective": 3.0},
+    "exploration": {"survival": 1.0, "exploration": 1.0, "combat": 0.7, "objective": 1.0},
+    "combat":      {"survival": 1.0, "exploration": 0.6, "combat": 1.3, "objective": 1.0},
+    "completion":  {"survival": 1.0, "exploration": 0.4, "combat": 1.0, "objective": 1.5},
 }
 
 # ── HUD normalisation caps (must match environment.py exactly for transfer) ───
@@ -55,6 +60,18 @@ _AMMO_CLIP_MAX  = 30
 _AMMO_RES_MAX   = 60
 _ENEMY_MAX      = 8
 _DIVERSITY_WINDOW = 20
+
+# ── Mission objective points (for potential-based navigation shaping) ─────────
+# Phase 0: head to the shotgun inside the barn.  Phase 1 (after pickup): head to
+# the bell zone (the well) and survive until the timer expires ("bell rings").
+_SHOTGUN_POS = (41.0, 10.0)   # Matches the shotgun ITEM_SPAWN in sim_game_state
+_BELL_POS    = (25.0, 25.0)   # Centre of BELL_ZONE / the well
+
+# Coarse visitation grid for genuine map-coverage exploration (replaces the old
+# "movement diversity" bonus, which rewarded oscillating in place).
+_COVERAGE_CELLS = 10          # 10×10 grid over the 50×50 map → 5×5-unit cells
+_PROGRESS_SCALE = 0.25        # Reward per world-unit of progress toward the goal
+_NEW_CELL_BONUS = 0.15        # One-off reward the first time each cell is entered
 
 
 class SimResidentEvilEnv(gym.Env):
@@ -155,6 +172,12 @@ class SimResidentEvilEnv(gym.Env):
         self._inv_opened:     bool   = False
         self._recent_mv:      deque  = deque(maxlen=_DIVERSITY_WINDOW)
 
+        # ── Navigation / coverage shaping state ───────────────────────────────
+        self._goal_phase:     int    = 0      # 0=to shotgun, 1=to bell
+        self._prev_goal_dist: float  = 0.0    # distance to current goal last step
+        self._visited_cells:  set    = set()  # coarse grid cells entered this episode
+        self._barn_reward_given: bool = False
+
         logger.info(
             "SimResidentEvilEnv[W%d] init: obs %dx%d %s ×%d-stack",
             worker_id, h, w,
@@ -193,6 +216,12 @@ class SimResidentEvilEnv(gym.Env):
         self._inv_opened     = False
         self._recent_mv.clear()
 
+        # Navigation / coverage shaping — reset for the new episode.
+        self._goal_phase        = 0
+        self._prev_goal_dist    = self._dist_to_goal()
+        self._visited_cells     = {self._cell_of(self._sim.player_x, self._sim.player_y)}
+        self._barn_reward_given = False
+
         obs = self._build_obs(frame, hud, detections)
         return obs, hud
 
@@ -219,11 +248,15 @@ class SimResidentEvilEnv(gym.Env):
         # Build obs BEFORE updating prev values (same order as environment.py)
         obs = self._build_obs(frame, hud, detections)
 
-        # Combat tracking for reward function
+        # Combat tracking for reward function — MUST mirror environment.py
+        # exactly (the in_combat flag is part of the HUD obs vector, so any
+        # divergence here is a sim-to-real distribution shift).
         if comb in (1, 3):
             self._in_combat = True
             self._was_aiming = True
-        elif comb == 0:
+        elif comb == 2:
+            self._in_combat = True
+        else:
             self._in_combat = False
             self._was_aiming = False
 
@@ -331,76 +364,138 @@ class SimResidentEvilEnv(gym.Env):
         )
         return {"frame": stacked, "hud": hud_vec}
 
+    def _goal_pos(self) -> Tuple[float, float]:
+        """Current navigation target: the shotgun until collected, then the bell."""
+        return _BELL_POS if self._sim.shotgun_collected else _SHOTGUN_POS
+
+    def _dist_to_goal(self) -> float:
+        gx, gy = self._goal_pos()
+        dx, dy = self._sim.player_x - gx, self._sim.player_y - gy
+        return float((dx * dx + dy * dy) ** 0.5)
+
+    @staticmethod
+    def _cell_of(x: float, y: float) -> Tuple[int, int]:
+        """Map a world position to a coarse visitation-grid cell."""
+        cx = int(min(_COVERAGE_CELLS - 1, max(0, x / MAP_W * _COVERAGE_CELLS)))
+        cy = int(min(_COVERAGE_CELLS - 1, max(0, y / MAP_H * _COVERAGE_CELLS)))
+        return cx, cy
+
     def _calculate_reward(
         self,
         hud: Dict,
         detections: List[Dict],
     ) -> Tuple[float, bool]:
         """
-        Reward function — mirrors environment.py's _calculate_reward as closely
-        as possible so the learned policy transfers to the real game.
+        Mission-shaped reward for the village siege.
 
-        Simulation-specific additions:
-          • shotgun_pickup_r  — large bonus for collecting the barn shotgun
-          • bell_r            — bonus for reaching the bell zone (episode goal)
+        The agent is guided through the actual objective arc — navigate to the
+        barn → grab the shotgun → reach the bell → survive until it rings —
+        rather than the old design where a per-step "movement diversity" bonus
+        dominated everything and the shotgun was physically uncollectable.
+
+        Design principles:
+          • Potential-based progress shaping gives a dense *gradient* toward the
+            current goal (shotgun, then bell).  Because it telescopes, the total
+            navigation reward depends only on how much closer the agent gets, not
+            on the path length — so it can't be farmed by wiggling.
+          • Genuine map coverage (first visit to each grid cell) replaces the old
+            in-place "diversity" wiggle bonus.
+          • Combat and damage are scaled so fighting and avoiding hits actually
+            matter relative to navigation.
+          • Big sparse payoffs anchor the milestones: shotgun pickup, barn entry,
+            and — crucially — surviving to the bell (which previously paid zero).
         """
         weights    = _CURRICULUM_WEIGHTS.get(self._curriculum_stage,
                                              _CURRICULUM_WEIGHTS["exploration"])
         terminated = self._sim.player_dead
 
+        # Snapshot BEFORE any updates — the herb-recovery check below needs the
+        # health value from the previous step, not the one we're about to write.
+        health_at_prev_step = self._prev_health
+
         # ── 1. Survival ───────────────────────────────────────────────────────
         curr_health = self._sim.health_pct
-        survival_r  = 0.1
+        survival_r  = 0.02   # small heartbeat for being alive
 
         if self._sim.damage_this_step > 0:
-            # Proportional to actual damage taken this step
-            survival_r -= 5.0 * (self._sim.damage_this_step / 100.0)
+            # Getting hit must hurt more than a step of movement is worth, or the
+            # agent learns to facetank the crowd.
+            survival_r -= 0.15 * self._sim.damage_this_step   # 12-dmg hit → -1.8
 
         if self._sim.player_dead:
-            survival_r -= 20.0
+            survival_r -= 25.0
 
         if curr_health < 0.2:
-            survival_r -= 0.3   # "Danger zone" — hurry and heal
+            survival_r -= 0.1   # "Danger zone" — find a herb / disengage
 
         self._prev_health = curr_health
 
         # ── 2. Combat ─────────────────────────────────────────────────────────
         kills   = self._sim.kills_this_step
         n_now   = len([d for d in detections if d["label"] == "enemy"])
-        combat_r = 0.5 * n_now + 3.0 * kills
+        combat_r = 5.0 * kills   # clean, dominant kill signal
+
+        # Did a bullet actually leave the gun this step?  (Clip decreased, or a
+        # kill registered.)  The old reward paid +0.5/step for merely HOLDING
+        # aim+shoot at a visible enemy — with an empty clip that was an
+        # infinite free-reward farm, and it's what taught the policy to hold
+        # comb=3 permanently (the "rooted Leon" pathology in the real game).
+        curr_clip  = self._sim.ammo_clip
+        ammo_spent = max(0, self._prev_ammo_clip - curr_clip)
+        shot_fired = ammo_spent > 0 or kills > 0
+        self._prev_ammo_clip = curr_clip
 
         comb = self._last_comb
         if n_now > 0:
-            if comb == 3:
-                combat_r += 2.0   # Aimed shot at visible enemy
+            if comb == 3 and shot_fired:
+                combat_r += 0.5   # genuine aimed shot at a visible enemy
             elif comb == 1:
-                combat_r += 0.5   # Holding aim
+                combat_r += 0.05  # holding aim (tiny — don't make it farmable)
             elif comb == 2 and not self._was_aiming:
-                combat_r -= 1.0   # Hip-fire (discouraged)
+                combat_r -= 0.3   # hip-fire (inaccurate in RE4 — discourage)
+        else:
+            # No enemy in sight: aiming roots you and firing wastes ammo — both
+            # are strictly bad in RE4.  The slowdown physics alone proved too
+            # indirect to unlearn the constant-aim habit; this makes the cost
+            # explicit per step.
+            if comb in (1, 3):
+                combat_r -= 0.1
+            if comb in (2, 3) and ammo_spent > 0:
+                combat_r -= 0.1
 
         if self._inv_opened and n_now > 0:
-            combat_r -= 5.0   # Inventory mid-combat = very bad
+            combat_r -= 3.0   # inventory mid-combat = frozen = bad
 
-        # Ammo discipline
-        curr_clip   = self._sim.ammo_clip
-        ammo_delta  = self._prev_ammo_clip - curr_clip
-        if ammo_delta > 0:
-            combat_r -= 0.1 * ammo_delta
-        self._prev_ammo_clip = curr_clip
+        # Ammo discipline (mild)
+        if ammo_spent > 0:
+            combat_r -= 0.05 * ammo_spent
 
-        # ── 3. Exploration / movement diversity ───────────────────────────────
-        mv_action = self._last_mv_action
-        if mv_action == 0:
-            exploration_r = -0.05
+        # ── 3. Navigation + coverage (the new "exploration") ──────────────────
+        # Potential-based progress toward the current goal.  Switching goals
+        # (shotgun → bell) re-baselines the distance so the discontinuity does
+        # NOT register as a huge one-step reward.
+        phase_now = 1 if self._sim.shotgun_collected else 0
+        curr_goal_dist = self._dist_to_goal()
+        if phase_now != self._goal_phase:
+            self._goal_phase = phase_now
+            progress_r = 0.0                       # re-baseline on goal switch
         else:
-            exploration_r = 0.05
-            if len(self._recent_mv) >= 5:
-                unique_moves   = len(set(self._recent_mv))
-                diversity_frac = unique_moves / 8.0
-                exploration_r += 0.2 * diversity_frac
+            progress_r = _PROGRESS_SCALE * (self._prev_goal_dist - curr_goal_dist)
+        self._prev_goal_dist = curr_goal_dist
+
+        # Genuine coverage: reward the first entry into each coarse grid cell.
+        exploration_r = progress_r
+        cell = self._cell_of(self._sim.player_x, self._sim.player_y)
+        if cell not in self._visited_cells:
+            self._visited_cells.add(cell)
+            exploration_r += _NEW_CELL_BONUS
+
+        # Mild anti-idle nudge (keeps it moving without the wiggle exploit).
+        if self._last_mv_action == 0:
+            exploration_r -= 0.02
 
         # ── 4. Item collection ────────────────────────────────────────────────
-        item_r = 0.0
+        item_r   = 0.0
         curr_res = self._sim.ammo_reserve
 
         if curr_res > self._prev_ammo_res:
@@ -408,34 +503,44 @@ class SimResidentEvilEnv(gym.Env):
             item_r += 2.0 * min(delta_res / 10.0, 3.0)
         self._prev_ammo_res = curr_res
 
-        # Health recovery (using a herb)
-        if curr_health > self._prev_health + 0.05:
-            item_r += 1.0
+        # Health recovery (using a herb).  Compares against the PRE-update
+        # snapshot — self._prev_health was already overwritten above, so the
+        # old comparison could never fire (dead code until now).
+        if curr_health > health_at_prev_step + 0.05:
+            item_r += 2.0
 
-        # Simulation-specific: huge bonus for collecting the barn shotgun
+        # ── 5. Mission objectives ─────────────────────────────────────────────
+        objective_r = item_r
+
+        # First time entering the barn — a milestone on the way to the shotgun.
+        if self._sim.barn_visited and not self._barn_reward_given:
+            objective_r += 8.0
+            self._barn_reward_given = True
+
+        # The main objective: collect the barn shotgun.
         if self._sim.shotgun_this_step:
-            item_r += 15.0   # This is the episode's "main objective"
+            objective_r += 25.0
 
-        # Bonus for first barn visit (exploration milestone)
-        if self._sim.barn_visited and not hasattr(self, "_barn_reward_given"):
-            item_r += 5.0
-            self._barn_reward_given = True  # type: ignore[attr-defined]
+        # After the shotgun, reward holding the bell zone (the well) — the place
+        # to be when the bell rings.
+        if self._sim.shotgun_collected and self._sim.bell_area_reached:
+            objective_r += 0.1
 
-        # ── 5. Simulation objectives ──────────────────────────────────────────
-        # Workers are isolated processes — no LLM connection.
-        # Objective reward comes purely from sim milestone tracking.
-        objective_r = 0.0
-
-        # Bonus for staying alive until the bell — progress toward completing
-        # the village siege
-        if self._sim.bell_area_reached:
-            objective_r += 0.3
+        # THE WIN: survive until the timer expires (the bell rings).  The payoff
+        # is GATED on having collected the shotgun first, so "just camp the bell
+        # zone and dodge everyone" is no longer a near-optimal strategy — the
+        # full reward requires completing the actual objective chain
+        # (barn → shotgun → survive).  Surviving without the shotgun still earns
+        # a small credit (don't punish staying alive), but it's ~7× less than
+        # doing the whole mission, which makes the barn detour clearly worth it.
+        if self._sim.episode_success:
+            objective_r += 35.0 if self._sim.shotgun_collected else 5.0
 
         # ── Weighted sum ──────────────────────────────────────────────────────
         reward = (
-            weights["survival"]    * survival_r
-            + weights["combat"]    * combat_r
-            + weights["exploration"] * (exploration_r + item_r)
+            weights["survival"]      * survival_r
+            + weights["combat"]      * combat_r
+            + weights["exploration"] * exploration_r
             + weights["objective"]   * objective_r
         )
 

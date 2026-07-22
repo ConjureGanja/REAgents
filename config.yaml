@@ -3,17 +3,75 @@
 # Edit this file to tune the agent without touching any Python code.
 # All file paths are relative to the project root (where main.py lives).
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GAME PROFILES (scaffolding — see RE_MULTI_GAME_ROADMAP.md)
+# ─────────────────────────────────────────────────────────────────────────────
+# The long-term goal is one agent that plays RE2, RE3, and RE4 Remakes.  Each
+# game needs its own: window title, HUD calibration (health is a radial ring in
+# RE4 but a vignette/heartbeat indicator in RE2/RE3), menu reset sequence, and
+# walkthrough guide data.  Everything below `game_settings` stays per-game.
+#
+# STATUS: `active_profile` is declarative for now — code still reads
+# `game_settings` / `perception` / `reset` directly, which are the RE4 values.
+# When an RE2/RE3 profile is filled in, the loader will merge the chosen
+# profile over those sections (single code change in config loading, no
+# rewrites elsewhere — that's why the spaces/contracts below stay identical).
+#
+# Analogy: same driver, different cars — the steering wheel and pedals (action
+# space) are identical; only the dashboard layout (HUD parsing) and the garage
+# door code (menu reset) change per car.
+game_profiles:
+  active_profile: "re4_remake"
+  re4_remake:
+    window_title_substring: "RESIDENT EVIL 4"
+    guide_module:           "guide_data"        # walkthrough/tips module
+    health_style:           "radial_ring"       # bottom-right ring while aiming
+  # re2_remake:                                 # TODO — calibrate before enabling
+  #   window_title_substring: "RESIDENT EVIL 2"
+  #   guide_module:           "guide_data_re2"
+  #   health_style:           "ecg_vignette"    # screen-edge red + ECG in inventory
+  # re3_remake:                                 # TODO — calibrate before enabling
+  #   window_title_substring: "RESIDENT EVIL 3"
+  #   guide_module:           "guide_data_re3"
+  #   health_style:           "ecg_vignette"
+
 game_settings:
   title:                  "Resident Evil Agent"
   window_mode:            "Borderless Windowed"
   target_resolution:      [1920, 1080]
   monitor_index:          2          # 1 = primary monitor, 2 = secondary
   window_title_substring: "RESIDENT EVIL 4"
+  capture_fps:            30          # Background grabber rate (min 20 enforced in code) — keeps the agent's vision real-time
+  perception_fps:         10          # How often YOLO+OCR re-run (cached between); decoupled from vision so the step loop stays fast
   capture_region:
     top:    0
     left:   0
     width:  1920
     height: 1080
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTROLS / INPUT SMOOTHING  (real-game only — ignored in simulation)
+# ─────────────────────────────────────────────────────────────────────────────
+# Makes the virtual gamepad output look like a HUMAN playing instead of a robot
+# twitching.  Without this, the policy can flip the stick to a new direction
+# every ~40 ms, producing spasmodic motion and snapping camera pans.  The
+# smoothing layer low-pass-filters the analog sticks toward their target each
+# step, so Leon eases into turns, the camera pans smoothly, and aim raises
+# gradually — while discrete buttons (shoot, interact, dodge) stay crisp.
+#
+#   move_alpha      — left-stick low-pass.  Higher = snappier, lower = floatier.
+#                     0.35 ≈ reaches full speed/direction in ~0.3 s (natural accel).
+#   camera_alpha    — right-stick low-pass (camera pan smoothing).
+#   camera_max_rate — hard cap on right-stick change per step (turn-rate limit;
+#                     prevents fast snapping even on a big target change).
+#   aim_alpha       — how fast the aim trigger ramps in (gun raises smoothly).
+controls:
+  smoothing:
+    enabled:         true
+    move_alpha:      0.35
+    camera_alpha:    0.25
+    camera_max_rate: 0.20
+    aim_alpha:       0.50
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PERCEPTION
@@ -25,14 +83,29 @@ perception:
   # Pixel coords [y1, x1, y2, x2] in full 1920×1080 space.
   # IMPORTANT: these must be calibrated to your monitor layout.
   # Run `python perception.py` while the game is running to see the boxes.
+  # NOTE: the RE4 Remake HUD (radial health ring + weapon/ammo) is only visible
+  # while Leon is AIMING a weapon.  These regions target that radial in the
+  # bottom-right.  Calibrated against a live 1920×1080 capture on monitor 2.
   ocr_regions:
-    ammo: [900, 1550, 980, 1900]     # Ammo counter — bottom-right HUD
+    ammo: [872, 1692, 916, 1768]     # "clip / reserve" text inside the aim radial
 
-  health_circle: [880, 80, 980, 180] # Health ring — top-left HUD
+  # Health RADIAL ring (bottom-right, only while aiming).  [y1,x1,y2,x2] box.
+  health_circle: [790, 1660, 930, 1820]
+  # Colored ring-pixel count at FULL health — used to normalise health%.
+  # (Replaces the old box-area×0.15 heuristic, which was wrong for a thin arc.)
+  health_full_px: 1100
+  # Below this FRACTION of health_full_px the ring is treated as NOT VISIBLE
+  # (health reads as unknown/None, held at last good value) instead of "almost
+  # dead".  Stray warm pixels (torches, sunlit walls) used to read as 1-5%
+  # health and trip phantom deaths every ~20 s.
+  health_min_visible_frac: 0.08
   health_colors:
-    fine:    [[35, 50, 50], [85, 255, 255]]    # Green  — full / good health
-    caution: [[10, 50, 50], [30, 255, 255]]    # Orange — ~50% health
-    danger:  [[0,  50, 50], [10, 255, 255]]    # Red    — critical health
+    # V (brightness) floor raised to ~95: the HUD arc is bright (V≈130) while the
+    # world behind the ring is dark (V≈45), so this rejects background bleed into
+    # the colour mask.  Arc colour encodes health: green=full, orange=half, red=low.
+    fine:    [[35, 60,  95], [85, 255, 255]]   # Green  — full / good health
+    caution: [[10, 70, 100], [30, 255, 255]]   # Orange — ~50% health
+    danger:  [[0,  70, 100], [10, 255, 255]]   # Red    — critical health
 
   template_match_threshold: 0.85
   health_smooth_window:     5        # Rolling average frames for health reading
@@ -86,9 +159,45 @@ rl_hyperparameters:
   clip_range:          0.2             # PPO clip (don't change too much per update)
   ent_coef:            0.01            # Entropy bonus (keeps policy exploring)
   max_grad_norm:       0.5             # Gradient clipping (training stability)
+  target_kl:           0.04            # Early-stop policy updates when KL divergence
+                                       # exceeds this — the #1 guard against the
+                                       # catastrophic policy collapse seen in the
+                                       # June 28 sim run (policy stopped shooting).
+  lr_schedule:         "linear"        # "linear" decays LR to 0 over the run
+                                       # (stabilises late training); "constant" = old behaviour
 
   # Action timing
-  action_hold_seconds: 0.08            # How long each action is held (~12 Hz decision rate)
+  # 0.04 s targets a ~20 Hz decision/vision rate.  Movement sticks PERSIST across
+  # steps (see controls.execute_step), so a shorter hold doesn't weaken walking —
+  # it only shortens discrete button taps, which XInput still registers fine.
+  action_hold_seconds: 0.04            # ~20 Hz decision rate (was 0.08 ≈ 12 Hz)
+
+  # Death-detection robustness (stops phantom-death reset loops from a flaky
+  # health reading).
+  #   PRIMARY signal: the "YOU ARE DEAD" screen (dark centre + red lettering),
+  #     confirmed over `death_screen_confirm_reads` consecutive fresh
+  #     perception reads.
+  #   FALLBACK signal: health stays at/below `low_health_threshold` for
+  #     `death_confirm_steps` consecutive FRESH perception reads, AND health
+  #     was already below 50% when the streak began (plausible descent).
+  #   Neither fires within `reset_grace_steps` after a reload, and single-step
+  #   drops bigger than `max_plausible_health_drop` are treated as misreads.
+  death_confirm_steps:        10
+  death_screen_confirm_reads: 8
+  low_health_threshold:       0.12
+  reset_grace_steps:          15
+  max_plausible_health_drop:  0.5
+
+  # Aim/shoot gate latch — combat actions are allowed for this many seconds
+  # after the last YOLO enemy sighting (prevents a single missed detection
+  # from strobing combat off mid-fight).
+  enemy_latch_seconds:        3.0
+
+  # Anti-freeze exploration prior
+  # When no enemies are visible and the policy picks "stop", nudge Leon to keep
+  # walking/scanning so he traverses the village instead of standing still and
+  # getting mobbed. Set false to train pure RL with no scripted movement.
+  anti_freeze_explore: true
 
   # Reward normalisation
   use_vec_normalize:   true            # Highly recommended for training stability
@@ -111,6 +220,10 @@ llm_settings:
   temperature:          0.5             # Lower = more deterministic; 0.5 = balanced
   llm_every_n_steps:    60              # Consult every 60 RL steps (~5 s at 12 Hz)
   call_cooldown_seconds: 5.0            # Minimum gap between API calls (cost control)
+  override_hold_steps:  60              # Re-apply Claude's movement override for N steps
+                                        # (~2.4 s at 20 Hz) so its navigation actually steers
+                                        # Leon and covers most of the gap between consults
+                                        # (consults are gated to ~every 5 s by the cooldown).
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STORAGE
@@ -131,12 +244,16 @@ storage:
 # If your menu layout has different items above "Load Game" (e.g. a DLC adds
 # an entry), increase nav_down_count.
 reset:
-  nav_down_count:    1     # Presses of Down arrow to reach "Load Game"
-  confirm_key:       "f"   # Key used to select items (default interact key)
-  menu_open_wait:    1.5   # Seconds after ESC for pause menu to render
-  nav_between_wait:  0.4   # Seconds between arrow-key navigation presses
-  select_wait:       1.0   # Seconds after selecting "Load Game"
-  confirm_wait:      0.5   # Seconds between confirmation presses
+  nav_down_count:    1     # D-pad Down presses to reach "Load Game"
+  confirm_key:       "f"   # (legacy, unused with gamepad) key used to select items
+  menu_open_wait:    1.5   # Seconds after Start for pause menu to render
+  nav_between_wait:  0.4   # Seconds between navigation presses
+  select_wait:       1.0   # Seconds after opening the save list
+  confirm_wait:      0.5   # Seconds after picking the save slot (before Yes/No dialog)
+  # The "Load? Yes/No" dialog defaults to NO. These move the cursor onto YES
+  # before the final confirm — fixes the reset wandering into other menus.
+  confirm_yes_dir:   "left"  # Direction to reach "Yes": left/right/up/down
+  confirm_yes_count: 1       # How many presses of that direction to land on "Yes"
   loading_wait:      8.0   # Seconds after final confirm for the game to load
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -208,10 +325,20 @@ simulation:
   max_episode_steps:  600      # Steps before the "bell rings" and episode succeeds
   player_speed:       0.6      # Units moved per step (regular movement)
   sprint_multiplier:  1.8      # Speed boost when evasion action = sprint
+  aim_move_mult:      0.5      # Movement multiplier while aiming (RE4 roots Leon
+                               # when the gun is raised — matching this physics
+                               # stops the policy from learning constant-aim).
+                               # NOTE: 0.3 proved too harsh to learn from scratch
+                               # (July 7 fable5_final3 run never converged); 0.5
+                               # is for fine-tuning a policy that already
+                               # knows how to survive.
   dodge_cooldown:     8        # Steps between dodge rolls
   enemy_speed:        0.28     # Enemy movement units per step (patrol)
   enemy_chase_speed:  0.40     # Enemy speed when chasing player
   enemy_detection_range: 14.0  # Units — enemy "sees" player within this radius
+  vision_range:       22.0     # Units — how far the PLAYER's "camera" sees enemies
+                               # (get_detections mimics on-screen YOLO, not omniscience)
+  vision_fov_deg:     140.0    # Player vision cone width in degrees
   enemy_attack_range:    1.8   # Units — enemy deals damage within this radius
   enemy_attack_damage:   12.0  # Health points lost per enemy hit (out of 100)
   enemy_attack_cooldown: 15    # Steps between enemy attacks

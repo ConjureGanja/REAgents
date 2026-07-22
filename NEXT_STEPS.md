@@ -140,19 +140,32 @@ Your codebase includes a **simulation environment** that trains **~6000× faster
 
 ### Action Items
 
-#### 2.1 Run Simulation Training
-```bash
-# Train in simulation for 600k steps
-python sim_main.py --total-timesteps 600000
+#### 2.1 Run Simulation Training (Now Fixed)
 
-# This creates: sim_re_agent_final.zip
+**The simulation pipeline has been improved:**
+- Fixed `list assignment index out of range` crash in `SimDashboardCallback`
+- Robust `SharedState` initialization for all workers
+- Better error handling in memory and curriculum callbacks
+- `train_sim_complete.py` now correctly wires `SimMemoryCallback`
+
+**Recommended command (full sim-to-real pipeline):**
+```bash
+# Quick verification run
+python train_sim_complete.py --timesteps 20000 --eval-every 5000 --no-llm
+
+# Full pre-training run (recommended)
+python train_sim_complete.py --timesteps 600000 --eval-every 50000 --eval-episodes 20
 ```
+
+This produces `models/checkpoints/sim_re_agent_for_real.zip` — ready for transfer.
 
 #### 2.2 Transfer to Real Game
 ```bash
-# Load sim policy and fine-tune on real game
-python main.py --resume models/checkpoints/sim_re_agent_final.zip
+# Load the sim-to-real converted policy
+python main.py --resume models/checkpoints/sim_re_agent_for_real.zip
 ```
+
+The `train_sim_complete.py` script automatically creates this transfer-ready checkpoint with domain-randomization-aware weights.
 
 **Expected Results:**
 - Sim training completes in minutes

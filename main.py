@@ -5,7 +5,7 @@ Usage:
     python main.py                            # start fresh
     python main.py --resume path/to/ckpt.zip  # resume training
     python main.py --no-llm                   # disable LLM (RL only)
-    python main.py --no-record                # disable gameplay recording
+    python main.py --record                    # ENABLE gameplay recording (off by default)
     python main.py --dashboard-only           # just show the dashboard, no training
 
 Architecture:
@@ -22,10 +22,19 @@ LLM REQUIREMENT:
 """
 
 import argparse
+import ctypes
 import logging
 import os
 import threading
 import time
+
+# Set per-monitor DPI awareness before any mss or Win32 screen calls.
+# Without this, Windows DPI virtualisation causes mss to report scaled-up
+# monitor coordinates on high-DPI monitors, producing an offset/black capture.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    pass
 
 from dotenv import load_dotenv
 
@@ -41,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config",         default="config.yaml",  help="Path to config.yaml")
     p.add_argument("--resume",         default=None,           help="Checkpoint .zip to resume from")
     p.add_argument("--no-llm",         action="store_true",    help="Disable LLM integration")
-    p.add_argument("--no-record",      action="store_true",    help="Disable gameplay video recording")
+    p.add_argument("--record",         action="store_true",    help="Enable gameplay video recording (OFF by default — 1080p MP4 encoding costs real CPU/FPS)")
     p.add_argument("--dashboard-only", action="store_true",    help="Launch dashboard without training")
     p.add_argument("--log-level",      default="INFO",         help="Logging level (DEBUG/INFO/WARNING)")
     return p.parse_args()
@@ -50,24 +59,67 @@ def parse_args() -> argparse.Namespace:
 def _failsafe_watchdog(shared: SharedState) -> None:
     """
     Polls mouse position at 20 Hz and stops the agent if the cursor reaches
-    any screen corner.
+    the top-left corner of the virtual desktop (covers all monitors).
 
-    Why a custom watchdog instead of pyautogui's built-in failsafe?
-    pyautogui only fires its failsafe *inside* a SendInput call — there are
-    gaps between calls where it won't trigger.  Our watchdog polls continuously
-    so any corner touch stops the agent within 50 ms.
+    Why virtual desktop bounds instead of pyautogui.size()?
+    pyautogui.size() returns only the PRIMARY monitor dimensions. On a
+    multi-monitor setup the secondary monitor has x-coordinates beyond that
+    width, so any mouse position on monitor 2 would falsely trigger the
+    right-edge check (x >= sw - 3). We use SM_CXVIRTUALSCREEN / SM_XVIRTUALSCREEN
+    to get the true bounds of the full desktop across all monitors, and only
+    check the top-left corner so the right/bottom edges of monitor 1 (which are
+    the middle of the desktop) never fire.
     """
+    import ctypes
     import pyautogui
     log = logging.getLogger("failsafe")
     try:
-        sw, sh = pyautogui.size()
-        log.info("Failsafe watchdog active — move mouse to any corner to stop the agent.")
+        user32 = ctypes.windll.user32
+        # Full virtual desktop origin and size (all monitors combined)
+        vx  = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+        vy  = user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+        vsw = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        vsh = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        x_min, y_min = vx + 2,       vy + 2
+        x_max, y_max = vx + vsw - 3, vy + vsh - 3
+        log.info(
+            "Failsafe watchdog active — virtual desktop %dx%d at (%d,%d). "
+            "Move mouse to any corner to stop the agent.",
+            vsw, vsh, vx, vy,
+        )
+        # DWELL requirement: the cursor must stay in a corner CONTINUOUSLY for
+        # this many seconds before the failsafe fires.  Why?  With the virtual
+        # gamepad the agent never controls the real mouse, so the old instant
+        # "mouse-to-corner = kill" panic button is obsolete AND harmful: corners
+        # are exactly where you click during normal PC use (Start menu, window
+        # close buttons, the seam between monitors).  A dwell window lets you use
+        # your PC freely while still preserving a deliberate emergency stop —
+        # just park the cursor in any corner and hold it there.
+        DWELL_SECONDS = 1.5
+        corner_since: float | None = None
         while not shared.stop_requested:
             x, y = pyautogui.position()
-            if x <= 2 or y <= 2 or x >= sw - 3 or y >= sh - 3:
-                shared.update(stop_requested=True)
-                log.warning("FAILSAFE triggered at (%d, %d) — agent stopped.", x, y)
-                return
+            # Only trigger on CORNERS — not on edges.  Moving the mouse along
+            # the bottom or right edge of the primary monitor is normal; only
+            # landing in one of the four corner zones should stop the agent.
+            in_left   = x <= x_min
+            in_right  = x >= x_max
+            in_top    = y <= y_min
+            in_bottom = y >= y_max
+            in_corner = (in_left or in_right) and (in_top or in_bottom)
+            if in_corner:
+                now = time.time()
+                if corner_since is None:
+                    corner_since = now
+                elif now - corner_since >= DWELL_SECONDS:
+                    shared.update(stop_requested=True)
+                    log.warning(
+                        "FAILSAFE triggered at (%d, %d) — cursor held in corner "
+                        "%.1fs — agent stopped.", x, y, DWELL_SECONDS,
+                    )
+                    return
+            else:
+                corner_since = None   # left the corner — reset the dwell timer
             time.sleep(0.05)
     except Exception as exc:
         log.error("Failsafe watchdog crashed: %s", exc)
@@ -183,7 +235,17 @@ def _training_thread(
             time.sleep(0.5)
 
         if not shared.stop_requested:
-            log.info("Training started.")
+            log.info("Training started — escaping any open menus before first episode…")
+            try:
+                from controls import GameControls
+                import yaml as _yaml2
+                with open(config_path) as _f2:
+                    _cfg2 = _yaml2.safe_load(_f2)
+                _title2 = _cfg2["game_settings"].get("window_title_substring", "RESIDENT EVIL 4")
+                _ctrl_tmp = GameControls(_title2)
+                _ctrl_tmp.escape_to_gameplay()
+            except Exception as _esc_exc:
+                log.warning("Pre-training menu escape failed (non-fatal): %s", _esc_exc)
             trainer.train()
     except Exception as exc:
         log.exception("Training thread crashed: %s", exc)
@@ -230,9 +292,16 @@ def main() -> None:
     ).start()
 
     # 5. Gameplay recorder (saves .mp4 footage for review)
+    #    OFF by default: software-encoding a 1080p MP4 at 20 fps competes with
+    #    capture + perception + the policy forward pass and noticeably lowers the
+    #    agent's decision/vision FPS.  Opt in with --record only when you actually
+    #    want footage to review.
     recorder = None
-    if not args.no_record:
+    if args.record:
         recorder = GameplayRecorder(shared, output_dir="footage", fps=20)
+        logger.info("Gameplay recording ENABLED (--record) — expect some FPS cost.")
+    else:
+        logger.info("Gameplay recording disabled (default). Pass --record to enable.")
 
     # 6. LLM advisor (Claude-only — only ANTHROPIC_API_KEY needed)
     llm, consultant = (None, None) if args.no_llm else _build_llm(

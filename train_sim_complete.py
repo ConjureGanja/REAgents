@@ -132,6 +132,15 @@ def parse_args() -> argparse.Namespace:
 # Env factory (used by SubprocVecEnv)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _atomic_save(model, path: Path) -> None:
+    """Save a checkpoint via temp-file + rename so an interrupted run can never
+    leave a truncated (corrupt) .zip — the failure mode that produced the
+    unloadable sim_re_agent_final.zip on June 28."""
+    tmp = path.with_name(path.stem + ".tmp.zip")
+    model.save(str(tmp))
+    os.replace(tmp, path)
+
+
 def make_env_factory(config_path: str, worker_id: int,
                      preset: str, enabled: bool):
     """
@@ -227,10 +236,20 @@ def build_model(env, cfg: Dict, tensorboard_dir: str):
         policy_kwargs["lstm_hidden_size"] = rl_cfg.get("lstm_hidden_size", 256)
         policy_kwargs["n_lstm_layers"]    = rl_cfg.get("n_lstm_layers", 1)
 
+    # Linear LR decay + target_kl guard — both are stability measures against
+    # the catastrophic policy collapse observed in the June 28 "capped_aim"
+    # run (policy stopped shooting entirely and died every episode).
+    lr_value = float(rl_cfg.get("learning_rate", 2.5e-4))
+    if str(rl_cfg.get("lr_schedule", "constant")).lower() == "linear":
+        learning_rate = lambda progress_remaining: lr_value * progress_remaining
+    else:
+        learning_rate = lr_value
+
     model = ModelCls(
         policy=policy_name,
         env=env,
-        learning_rate=rl_cfg.get("learning_rate", 2.5e-4),
+        learning_rate=learning_rate,
+        target_kl    = rl_cfg.get("target_kl", None),
         n_steps      = rl_cfg.get("n_steps", 512),
         batch_size   = rl_cfg.get("batch_size", 128),
         n_epochs     = rl_cfg.get("n_epochs", 4),
@@ -250,14 +269,16 @@ def build_model(env, cfg: Dict, tensorboard_dir: str):
 # Training callbacks
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _build_callbacks(shared, n_workers: int, cfg: Dict, ckpt_dir: str):
+def _build_callbacks(shared, memory, n_workers: int, cfg: Dict, ckpt_dir: str):
     """
     Build the callback stack — reuses the existing simfunctional callbacks
     from sim_trainer.py so the dashboard wiring stays intact.
     """
     from stable_baselines3.common.callbacks import CheckpointCallback
     from sim_trainer import (
-        SimDashboardCallback, SimMemoryCallback, SimCurriculumCallback,
+        SimDashboardCallback,
+        SimMemoryCallback,
+        SimCurriculumCallback,
     )
 
     # Periodic save — pre-empts catastrophic crashes
@@ -269,8 +290,9 @@ def _build_callbacks(shared, n_workers: int, cfg: Dict, ckpt_dir: str):
     )
 
     dashboard_cb = SimDashboardCallback(shared, n_workers)
+    memory_cb    = SimMemoryCallback(memory, shared)  # memory param added for consistency
     curric_cb    = SimCurriculumCallback(shared, cfg["curriculum"])
-    return [checkpoint_cb, dashboard_cb, curric_cb]
+    return [checkpoint_cb, dashboard_cb, memory_cb, curric_cb]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -278,7 +300,7 @@ def _build_callbacks(shared, n_workers: int, cfg: Dict, ckpt_dir: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def train_with_eval(
-    args, cfg: Dict, shared: SharedState, run_dir: Path,
+    args, cfg: Dict, shared: SharedState, run_dir: Path, memory: MemorySystem,
 ) -> Optional[str]:
     """
     Returns: path to best-eval checkpoint, or None if training was interrupted.
@@ -314,20 +336,48 @@ def train_with_eval(
         for i in range(n_workers)
     ]
     raw_vec = SubprocVecEnv(env_fns, start_method="spawn")
-    train_env = VecNormalize(
-        raw_vec,
-        norm_obs=False,
-        norm_reward=True,
-        clip_reward=10.0,
-        gamma=cfg["rl_hyperparameters"].get("gamma", 0.99),
-    )
+
+    # When resuming, restore the sibling VecNormalize stats pkl if it exists.
+    # Resuming a policy while RESETTING the reward-normalisation stats rescales
+    # every reward the value function sees — that silent mismatch is what
+    # collapsed the June 28 sim run.
+    resume_norm_pkl: Optional[Path] = None
+    if args.resume:
+        cand = Path(args.resume).with_name(Path(args.resume).stem + "_vecnorm.pkl")
+        if cand.exists():
+            resume_norm_pkl = cand
+
+    if resume_norm_pkl is not None:
+        train_env = VecNormalize.load(str(resume_norm_pkl), raw_vec)
+        train_env.training    = True
+        train_env.norm_reward = True
+        logger.info("VecNormalize stats restored from %s", resume_norm_pkl)
+    else:
+        if args.resume:
+            logger.warning(
+                "No _vecnorm.pkl found next to %s — reward normalisation "
+                "starts fresh (expect a few noisy updates).", args.resume,
+            )
+        train_env = VecNormalize(
+            raw_vec,
+            norm_obs=False,
+            norm_reward=True,
+            clip_reward=10.0,
+            gamma=cfg["rl_hyperparameters"].get("gamma", 0.99),
+        )
 
     # ── Build model ───────────────────────────────────────────────────────────
     tb_dir = cfg["storage"]["tensorboard_dir"]
     model, ModelCls = build_model(train_env, cfg, tb_dir)
     if args.resume:
-        model = ModelCls.load(args.resume, env=train_env, tensorboard_log=tb_dir)
-        logger.info("Resumed from %s", args.resume)
+        try:
+            model = ModelCls.load(args.resume, env=train_env, tensorboard_log=tb_dir)
+            logger.info("Resumed from %s", args.resume)
+        except Exception as exc:
+            logger.error(
+                "Could not load %s (%s) — file may be corrupt. "
+                "Continuing with a FRESH model.", args.resume, exc,
+            )
 
     # ── Build eval env (single, no DR) ────────────────────────────────────────
     logger.info("Building clean eval env (single-process, eval_preset, no DR)")
@@ -344,7 +394,7 @@ def train_with_eval(
     logger.info("Init: %s", summary.pretty())
 
     # ── Main loop: alternate learn() and evaluate() ─────────────────────────
-    callbacks = _build_callbacks(shared, n_workers, cfg, ckpt_dir)
+    callbacks = _build_callbacks(shared, memory, n_workers, cfg, ckpt_dir)
     shared.update(is_training=True)
 
     elapsed_steps = model.num_timesteps   # respects --resume's starting count
@@ -376,7 +426,7 @@ def train_with_eval(
             # ── Save best policy separately ──────────────────────────────────
             if is_best:
                 best_path = Path(ckpt_dir) / "sim_re_agent_best.zip"
-                model.save(str(best_path))
+                _atomic_save(model, best_path)
                 if isinstance(train_env, VecNormalize):
                     train_env.save(str(best_path).replace(".zip", "_vecnorm.pkl"))
                 best_ckpt_path = str(best_path)
@@ -389,7 +439,7 @@ def train_with_eval(
     finally:
         # Always save final policy & VecNormalize stats
         final_path = Path(ckpt_dir) / "sim_re_agent_final.zip"
-        model.save(str(final_path))
+        _atomic_save(model, final_path)
         if isinstance(train_env, VecNormalize):
             train_env.save(str(final_path).replace(".zip", "_vecnorm.pkl"))
         logger.info("Saved FINAL policy → %s", final_path)
@@ -457,7 +507,7 @@ def main():
 
     # ── Train ────────────────────────────────────────────────────────────────
     try:
-        best_ckpt = train_with_eval(args, cfg, shared, run_dir)
+        best_ckpt = train_with_eval(args, cfg, shared, run_dir, memory)
     finally:
         memory.stop()
 

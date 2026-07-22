@@ -125,11 +125,15 @@ def _build_prompt(
         f"{d['label']}({d['confidence']:.0%})" for d in detections[:8]
     ) or "none"
 
+    # health_pct is None when the HUD ring isn't visible (Leon not aiming)
+    _hp = hud.get("health_pct", None)
+    health_str = f"{float(_hp):.0%}" if _hp is not None else "unknown (HUD hidden — Leon not aiming)"
+
     prompt = f"""You are the AI brain of a Resident Evil 4 Remake agent.
 You receive the current game frame and sensor data. Provide concise, actionable guidance.
 
 === SENSOR DATA ===
-Health:    {float(hud.get('health_pct', 1.0)):.0%}
+Health:    {health_str}
 Ammo clip: {hud.get('ammo_clip', '?')}
 Ammo res:  {hud.get('ammo_res', '?')}
 Detections: {det_summary}
@@ -169,6 +173,10 @@ OBJECTIVE: reach shotgun house north of village
 
 # ── Response parser ────────────────────────────────────────────────────────────
 
+# Must mirror the env's MultiDiscrete([9, 5, 2, 4, 3, 2]) — the single source of
+# truth for what a valid action override looks like.
+_ACTION_SPACE_SIZES = (9, 5, 2, 4, 3, 2)
+
 class _ParsedResponse:
     __slots__ = ("vision", "plan", "decision", "override", "objective")
 
@@ -202,7 +210,18 @@ def _parse_response(text: str) -> _ParsedResponse:
             if raw.lower() not in ("null", "none", ""):
                 nums = [int(x) for x in re.findall(r"\d+", raw)]
                 if len(nums) == 6:
-                    result.override = nums
+                    # Clamp each element to the MultiDiscrete([9,5,2,4,3,2])
+                    # action-space bounds.  LLMs occasionally hallucinate an
+                    # out-of-range index (e.g. mv=9); unclamped, that silently
+                    # mapped to "no input" via dict .get defaults deep inside
+                    # controls — the override looked accepted but did nothing.
+                    # Analogy: a GPS telling you to take "exit 9" on a highway
+                    # that only has exits 0-8 — better to snap to the nearest
+                    # real exit than drive straight past everything.
+                    result.override = [
+                        max(0, min(n, hi - 1))
+                        for n, hi in zip(nums, _ACTION_SPACE_SIZES)
+                    ]
         elif stripped.startswith("OBJECTIVE:"):
             result.objective = stripped[len("OBJECTIVE:"):].strip()
     return result

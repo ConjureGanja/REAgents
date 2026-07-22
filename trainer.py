@@ -187,7 +187,10 @@ class MemoryCallback(BaseCallback):
             self._memory.end_episode(
                 total_reward=ep.get("r", 0.0),
                 steps=ep.get("l", 0),
-                death_count=ep.get("deaths", 0),
+                # Monitor replaces info["episode"] with its own dict, wiping the
+                # env's "deaths" key — read the top-level "death_count" the env
+                # now also sets (falls back to the old key for compatibility).
+                death_count=info.get("death_count", ep.get("deaths", 0)),
             )
             self._ep_id = self._memory.start_episode(
                 curriculum=self._shared.curriculum_stage
@@ -312,6 +315,8 @@ class RETrainer:
 
         monitored = Monitor(self._base_env)
         raw_env   = DummyVecEnv([lambda: monitored])
+        # Kept so load_checkpoint() can re-wrap it with restored VecNormalize stats.
+        self._raw_env = raw_env
 
         # Optional reward normalisation (recommended — reduces training variance)
         use_vecnorm = self._rl_cfg.get("use_vec_normalize", True)
@@ -337,15 +342,47 @@ class RETrainer:
         )
 
     def load_checkpoint(self, path: str) -> None:
-        """Resume training from a saved .zip checkpoint."""
+        """
+        Resume training from a saved .zip checkpoint.
+
+        Also restores the sibling `<name>_vecnorm.pkl` (VecNormalize running
+        reward stats) if present.  Resuming a policy with RESET normalisation
+        stats rescales every reward the value function sees — that mismatch is
+        what collapsed the June 28 sim run.
+
+        A corrupt/unreadable checkpoint no longer kills the trainer thread —
+        we log the error and continue with the freshly built model instead.
+        """
         algo = self._rl_cfg.get("algorithm", "RecurrentPPO")
         cls  = self._get_model_cls(algo)
-        self._model = cls.load(
-            path,
-            env=self._env,
-            tensorboard_log=self._storage["tensorboard_dir"],
-        )
-        logger.info("Resumed from checkpoint: %s", path)
+
+        # 1. Restore VecNormalize stats if a sibling pkl exists.
+        try:
+            norm_path = Path(path).with_name(Path(path).stem + "_vecnorm.pkl")
+            if norm_path.exists() and isinstance(self._env, VecNormalize):
+                self._env = VecNormalize.load(str(norm_path), self._raw_env)
+                self._env.training = True
+                logger.info("VecNormalize stats restored from %s", norm_path)
+        except Exception as exc:
+            logger.warning("VecNormalize restore failed (%s) — continuing with fresh stats.", exc)
+
+        # 2. Load the model itself.
+        try:
+            self._model = cls.load(
+                path,
+                env=self._env,
+                tensorboard_log=self._storage["tensorboard_dir"],
+            )
+            logger.info("Resumed from checkpoint: %s", path)
+        except Exception as exc:
+            logger.error(
+                "Could not load checkpoint %s (%s) — the file may be corrupt "
+                "(e.g. an interrupted save). Continuing with a FRESH model.",
+                path, exc,
+            )
+            # Re-point the already-built fresh model at the (possibly re-wrapped) env.
+            if self._model is not None:
+                self._model.set_env(self._env)
 
     def train(self) -> None:
         if self._model is None or self._env is None:
@@ -363,8 +400,21 @@ class RETrainer:
             )
         finally:
             self._shared.update(is_training=False)
+            # Neutralise the gamepad — sticks/triggers now persist across steps,
+            # so without this an interrupted run would leave Leon walking into a
+            # wall until the process exits.
+            try:
+                if self._base_env is not None and hasattr(self._base_env, "_ctrl"):
+                    self._base_env._ctrl.release_all()
+                    logger.info("Gamepad released — all axes/buttons neutralised.")
+            except Exception as exc:
+                logger.warning("Gamepad release on stop failed (non-fatal): %s", exc)
+            # Atomic save: write to a temp file then rename, so an interrupted
+            # save can never leave a truncated (corrupt) re_agent_final.zip.
             final_path = Path(self._storage["checkpoint_dir"]) / "re_agent_final.zip"
-            self._model.save(str(final_path))
+            tmp_path   = final_path.with_name(final_path.stem + ".tmp.zip")
+            self._model.save(str(tmp_path))
+            os.replace(tmp_path, final_path)
 
             # If VecNormalize is active, save its running stats too so they can
             # be restored when resuming — otherwise the first steps after resume
@@ -421,10 +471,19 @@ class RETrainer:
             policy_kwargs["lstm_hidden_size"] = self._rl_cfg.get("lstm_hidden_size", 256)
             policy_kwargs["n_lstm_layers"]    = self._rl_cfg.get("n_lstm_layers", 1)
 
+        # Learning-rate schedule — "linear" decays to 0 over the run, which
+        # stabilises late training; "constant" preserves the old behaviour.
+        lr_value = float(self._rl_cfg.get("learning_rate", 2.5e-4))
+        if str(self._rl_cfg.get("lr_schedule", "constant")).lower() == "linear":
+            learning_rate = lambda progress_remaining: lr_value * progress_remaining
+        else:
+            learning_rate = lr_value
+
         model = cls(
             policy=policy,
             env=self._env,
-            learning_rate=self._rl_cfg.get("learning_rate", 2.5e-4),
+            learning_rate=learning_rate,
+            target_kl=self._rl_cfg.get("target_kl", None),
             n_steps=self._rl_cfg.get("n_steps", 512),
             batch_size=self._rl_cfg.get("batch_size", 128),
             n_epochs=self._rl_cfg.get("n_epochs", 4),
