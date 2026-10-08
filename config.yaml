@@ -80,6 +80,11 @@ perception:
   yolo_model:            "yolo11n.pt"
   confidence_threshold:  0.40
 
+  # YOLO inference tuning: input letterbox size, FP16 on CUDA, device selection.
+  yolo_imgsz:            640           # network input size (letterboxed)
+  yolo_half:             true          # FP16 on CUDA — ~2× faster, no accuracy loss here
+  yolo_device:           null          # null = auto (cuda if available, else cpu)
+
   # Pixel coords [y1, x1, y2, x2] in full 1920×1080 space.
   # IMPORTANT: these must be calibrated to your monitor layout.
   # Run `python perception.py` while the game is running to see the boxes.
@@ -216,6 +221,10 @@ rl_hyperparameters:
 # To disable LLM entirely: run with --no-llm flag
 llm_settings:
   claude_model:         "claude-sonnet-4-6"   # Vision-capable Claude model
+  fast_model:           "claude-haiku-4-5"    # Cheap model for routine consults (two-tier advisor);
+                                              # set to null to always use claude_model
+  escalate_health_below: 0.50                  # health under this → strong model
+  escalate_on_enemies:  true                   # enemies on screen → strong model
   claude_max_tokens:    600
   temperature:          0.5             # Lower = more deterministic; 0.5 = balanced
   llm_every_n_steps:    60              # Consult every 60 RL steps (~5 s at 12 Hz)

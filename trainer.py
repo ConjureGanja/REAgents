@@ -158,6 +158,14 @@ class MemoryCallback(BaseCallback):
         self._ep_id  = 0
         self._step   = 0
 
+        # Combat metrics (combat_metrics.py): shots/kills/damage are derived
+        # from step-over-step HUD deltas — no game-memory reading required.
+        from combat_metrics import CombatLogger
+        self._combat        = CombatLogger()
+        self._prev_clip     = 0
+        self._prev_enemies  = 0
+        self._prev_hp: Optional[float] = None
+
     def _on_training_start(self) -> None:
         self._ep_id = self._memory.start_episode(curriculum=self._shared.curriculum_stage)
 
@@ -178,12 +186,34 @@ class MemoryCallback(BaseCallback):
             if d.get("label") in ("person", "zombie", "enemy")
         )
 
+        # ── Combat deltas ─────────────────────────────────────────────────────
+        clip = int(hud.get("ammo_clip", 0) or 0)
+        if 0 < clip < self._prev_clip:
+            self._combat.log_shot(self._prev_clip - clip)
+        self._prev_clip = clip
+
+        enemies_now = hud["enemy_count"]
+        if enemies_now < self._prev_enemies and self._combat.shot_recently():
+            self._combat.log_kill(self._prev_enemies - enemies_now)
+        self._prev_enemies = enemies_now
+
+        hp = hud.get("health_pct")
+        if hp is not None and self._prev_hp is not None:
+            drop = self._prev_hp - float(hp)
+            # Ignore implausible drops — same misread guard as the env's
+            # death detection (max 50% per step is real damage).
+            if 0.0 < drop <= 0.5:
+                self._combat.log_damage(drop, is_player=True)
+        if hp is not None and float(hp) > 0.0:
+            self._prev_hp = float(hp)
+
         if self._step % 10 == 0:
             self._memory.log_step(self._step, action, reward, hud)
 
         info = infos[0] if infos else {}
         if "episode" in info:
             ep = info["episode"]
+            final = self._combat.finalize_episode()
             self._memory.end_episode(
                 total_reward=ep.get("r", 0.0),
                 steps=ep.get("l", 0),
@@ -191,11 +221,23 @@ class MemoryCallback(BaseCallback):
                 # env's "deaths" key — read the top-level "death_count" the env
                 # now also sets (falls back to the old key for compatibility).
                 death_count=info.get("death_count", ep.get("deaths", 0)),
+                combat={
+                    "shots_fired": final.shots_fired,
+                    "kills":       final.kills,
+                    "accuracy":    final.accuracy,
+                },
             )
+            # Publish rolling combat stats for the dashboard Combat panel.
+            rolling = self._combat.get_rolling_stats()
+            if rolling:
+                self._shared.update(combat_stats=rolling)
             self._ep_id = self._memory.start_episode(
                 curriculum=self._shared.curriculum_stage
             )
             self._step = 0
+            self._prev_clip = 0
+            self._prev_enemies = 0
+            self._prev_hp = None
         else:
             self._step += 1
 
@@ -272,14 +314,15 @@ class RETrainer:
         shared: Optional[SharedState] = None,
         memory: Optional[MemorySystem] = None,
         consultant=None,   # Optional[LLMConsultant] — kept as Any to avoid import cycles
+        config: Optional[dict] = None,
     ):
         # Store the path so build() can pass it to ResidentEvilEnv.
         # Without this, build() was hardcoding "config.yaml" and ignoring any
         # --config flag the user passed on the command line.
         self._config_path = config_path
 
-        with open(config_path) as f:
-            self._cfg = yaml.safe_load(f)
+        from config_loader import ensure_config
+        self._cfg = ensure_config(config, config_path)
 
         self._shared     = shared or SharedState()
         self._memory     = memory or MemorySystem(self._cfg["storage"]["db_path"])
@@ -311,7 +354,7 @@ class RETrainer:
         Analogy: like converting temperatures to Celsius so the scale is always
         interpretable, regardless of whether you're in Iceland or the Sahara.
         """
-        self._base_env = ResidentEvilEnv(config_path=self._config_path, shared_state=self._shared)
+        self._base_env = ResidentEvilEnv(config=self._cfg, shared_state=self._shared)
 
         monitored = Monitor(self._base_env)
         raw_env   = DummyVecEnv([lambda: monitored])

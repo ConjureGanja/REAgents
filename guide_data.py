@@ -203,6 +203,21 @@ GENERAL_TIPS: list[str] = [
     "At Critical / Danger health (red ring), healing is the ONLY priority — stop fighting, find a herb.",
 ]
 
+# Tips ranked by curriculum stage — indices into GENERAL_TIPS, most relevant
+# first.  The LLM advisor injects only the top N for the ACTIVE stage instead
+# of a hardcoded first-6 slice, so the combat stage gets combat advice.
+STAGE_TIPS_RANKING: dict[str, list[int]] = {
+    "exploration": [12, 7, 11, 2, 8, 3],    # shotgun location, herbs, survive siege, sprint, gallery, treasures
+    "combat":      [0, 1, 4, 10, 13, 2],    # parry, leg-shot+kick, flash, flash reserve, heal-at-red, sprint
+    "completion":  [5, 6, 9, 3, 0, 1],      # rocket launcher, Red9, regenerators, treasures, parry, kick
+}
+
+
+def tips_for_stage(stage: str, n: int = 4) -> list[str]:
+    """Return the top-N most relevant GENERAL_TIPS for a curriculum stage."""
+    ranking = STAGE_TIPS_RANKING.get(stage) or list(range(len(GENERAL_TIPS)))
+    return [GENERAL_TIPS[i] for i in ranking[:n]]
+
 # ── Village-specific tactical knowledge (Chapter 1) ───────────────────────────
 VILLAGE_TACTICS: dict = {
     "spawn_area": {

@@ -14,14 +14,58 @@ class PerceptionSystem:
     The 'Eyes' of the Agent.
     Processes raw frames to extract HUD data and object detections.
     """
-    def __init__(self, config_path: str = "config.yaml"):
-        with open(config_path, "r") as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self, config_path: str = "config.yaml", config: Optional[Dict[str, Any]] = None):
+        from config_loader import ensure_config
+        self.config = ensure_config(config, config_path)
 
-        self.model = YOLO(self.config["perception"]["yolo_model"])
-        self.conf_threshold = float(self.config["perception"].get("confidence_threshold", 0.40))
-        self.reader = easyocr.Reader(['en'], gpu=True)
-        self.ocr_regions = self.config["perception"]["ocr_regions"]
+        perc = self.config["perception"]
+        self.model = YOLO(perc["yolo_model"])
+        self.conf_threshold = float(perc.get("confidence_threshold", 0.40))
+
+        # Inference device / precision — default to CUDA + FP16 when available.
+        self._device = perc.get("yolo_device") or ("cuda" if torch.cuda.is_available() else "cpu")
+        self._half   = bool(perc.get("yolo_half", True)) and self._device == "cuda"
+        self._imgsz  = int(perc.get("yolo_imgsz", 640))
+
+        # GPU sanity check — warn loudly if CUDA exists but isn't being used.
+        logger.info(
+            "YOLO device=%s half=%s imgsz=%d (cuda_available=%s, torch=%s)",
+            self._device, self._half, self._imgsz,
+            torch.cuda.is_available(), torch.__version__,
+        )
+        if torch.cuda.is_available() and self._device != "cuda":
+            logger.warning("CUDA is available but YOLO is configured for %s!", self._device)
+
+        self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+        logger.info("EasyOCR gpu=%s", torch.cuda.is_available())
+        self.ocr_regions = perc["ocr_regions"]
+
+        # Warmup: the first YOLO inference costs ~16 s (model load + CUDA kernel
+        # init).  Burn it here at startup instead of inside the first RL step.
+        try:
+            dummy = np.zeros((self._imgsz, self._imgsz, 3), dtype=np.uint8)
+            self.model(dummy, verbose=False, imgsz=self._imgsz,
+                       device=self._device, half=self._half)
+            logger.info("YOLO warmup inference complete.")
+        except Exception as exc:
+            logger.warning("YOLO warmup failed (non-fatal): %s", exc)
+
+        # ── GPU sanity check (T002 / plan P1.2) ──────────────────────────────
+        # A silent CPU fallback is the single most common reason perception
+        # crawls: YOLO and EasyOCR both "work" on CPU, just 5-10× slower, and
+        # nothing in the default logs tells you it happened.  Check once at
+        # startup and warn loudly so the fix (install CUDA torch) is obvious.
+        _cuda = torch.cuda.is_available()
+        _yolo_dev = str(getattr(self.model, "device", "unknown"))
+        _ocr_dev = str(getattr(self.reader, "device", "unknown"))
+        logger.info("Perception devices — torch.cuda=%s, YOLO=%s, EasyOCR=%s",
+                    _cuda, _yolo_dev, _ocr_dev)
+        if not _cuda:
+            logger.warning(
+                "CUDA is NOT available to PyTorch — YOLO/EasyOCR will run on CPU "
+                "(~5-10× slower). Install GPU torch first: pip install torch "
+                "torchvision --index-url https://download.pytorch.org/whl/cu121"
+            )
 
         # New: Health Circle configuration
         self.health_region = self.config["perception"]["health_circle"]
@@ -39,6 +83,7 @@ class PerceptionSystem:
         self.last_ammo = {"clip": "0", "reserve": "0"}
         self.health_buffer = [] # For smoothing jumps
         self.buffer_size = 5
+        self._last_ammo_fp = None   # ROI fingerprint for skip-unchanged OCR
 
     def reset_state(self) -> None:
         """Clear per-episode buffers.  Called by the env on reset so stale
@@ -51,7 +96,16 @@ class PerceptionSystem:
         """Detects enemies, items, and doors using YOLO."""
         if frame is None or frame.size == 0:
             return []
-        results = self.model(frame, verbose=False, conf=self.conf_threshold)[0]
+        # imgsz letterboxes the 1080p frame down for the network — the single
+        # biggest YOLO speed win (inference cost scales with pixel count).
+        results = self.model(
+            frame,
+            verbose=False,
+            conf=self.conf_threshold,
+            imgsz=self._imgsz,
+            device=self._device,
+            half=self._half,
+        )[0]
         detections = []
 
         for box in results.boxes:
@@ -154,7 +208,24 @@ class PerceptionSystem:
         # 2. Ammo (Split into Clip/Reserve)
         y1, x1, y2, x2 = self.ocr_regions["ammo"]
         roi = frame[y1:y2, x1:x2]
-        result = self.reader.readtext(roi, detail=0)
+
+        # Skip OCR entirely when the region is pixel-identical to the last read
+        # (ammo only changes on shots/pickups — most ticks would re-read the
+        # same digits).  Cheap shape+sum fingerprint is enough here.
+        roi_fp = (roi.shape, int(roi.sum())) if roi.size else None
+        if roi_fp is not None and roi_fp == self._last_ammo_fp:
+            result = None   # unchanged — keep cached last_ammo values
+        else:
+            self._last_ammo_fp = roi_fp
+            # Preprocess: grayscale → 2× upscale → Otsu threshold.  The ammo
+            # counter is white text on a dark HUD; binarising removes antialias
+            # noise that used to produce "l|" style garbage reads.
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # allowlist constrains recognition to digits + the clip/reserve
+            # separator — both faster and immune to letter-shaped artifacts.
+            result = self.reader.readtext(binary, detail=0, allowlist="0123456789/")
 
         if result:
             full_text = " ".join(result).replace(" ", "")

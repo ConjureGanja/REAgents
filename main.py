@@ -181,7 +181,7 @@ def _focus_monitor(shared: SharedState, game_title_sub: str) -> None:
         time.sleep(0.1)   # 10 Hz poll — fast enough to feel instant, cheap on CPU
 
 
-def _build_llm(config_path: str, shared: SharedState, memory: MemorySystem):
+def _build_llm(cfg: dict, shared: SharedState, memory: MemorySystem):
     """
     Initialise the Claude LLM advisor.
 
@@ -201,7 +201,7 @@ def _build_llm(config_path: str, shared: SharedState, memory: MemorySystem):
 
     try:
         from llm_agent import ClaudeAdvisor, LLMConsultant
-        advisor    = ClaudeAdvisor(config_path)
+        advisor    = ClaudeAdvisor(config=cfg)
         consultant = LLMConsultant(advisor, shared, memory=memory)
         logging.info("Claude LLM advisor ready.")
         return advisor, consultant
@@ -211,7 +211,7 @@ def _build_llm(config_path: str, shared: SharedState, memory: MemorySystem):
 
 
 def _training_thread(
-    config_path: str,
+    cfg: dict,
     shared: SharedState,
     memory: MemorySystem,
     consultant,
@@ -224,7 +224,7 @@ def _training_thread(
     log = logging.getLogger("trainer_thread")
     try:
         from trainer import RETrainer
-        trainer = RETrainer(config_path, shared, memory, consultant)
+        trainer = RETrainer(shared=shared, memory=memory, consultant=consultant, config=cfg)
         trainer.build()
 
         if resume_path:
@@ -238,10 +238,7 @@ def _training_thread(
             log.info("Training started — escaping any open menus before first episode…")
             try:
                 from controls import GameControls
-                import yaml as _yaml2
-                with open(config_path) as _f2:
-                    _cfg2 = _yaml2.safe_load(_f2)
-                _title2 = _cfg2["game_settings"].get("window_title_substring", "RESIDENT EVIL 4")
+                _title2 = cfg["game_settings"].get("window_title_substring", "RESIDENT EVIL 4")
                 _ctrl_tmp = GameControls(_title2)
                 _ctrl_tmp.escape_to_gameplay()
             except Exception as _esc_exc:
@@ -280,9 +277,8 @@ def main() -> None:
     # 4b. Focus monitor — auto-pauses when the game window loses focus so the
     #     user can interact with the browser dashboard freely without the agent
     #     sending stray keypresses or mouse movements to the wrong window.
-    import yaml as _yaml
-    with open(args.config) as _f:
-        _cfg = _yaml.safe_load(_f)
+    from config_loader import load_config
+    _cfg = load_config(args.config)   # parsed ONCE here; passed down everywhere
     _game_title = _cfg["game_settings"].get("window_title_substring", "RESIDENT EVIL 4")
     threading.Thread(
         target=_focus_monitor,
@@ -305,14 +301,14 @@ def main() -> None:
 
     # 6. LLM advisor (Claude-only — only ANTHROPIC_API_KEY needed)
     llm, consultant = (None, None) if args.no_llm else _build_llm(
-        args.config, shared, memory
+        _cfg, shared, memory
     )
 
     # 7. Trainer thread (starts paused; unblocked by the dashboard Start button)
     if not args.dashboard_only:
         threading.Thread(
             target=_training_thread,
-            args=(args.config, shared, memory, consultant, args.resume),
+            args=(_cfg, shared, memory, consultant, args.resume),
             daemon=True,
             name="TrainerThread",
         ).start()

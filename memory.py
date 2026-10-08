@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS episodes (
     chapter      TEXT    DEFAULT '',
     curriculum   TEXT    DEFAULT ''
 );
+-- Combat columns (shots_fired, kills, accuracy) are added to existing DBs by
+-- _init_schema via guarded ALTER TABLE — CREATE TABLE IF NOT EXISTS won't
+-- retrofit them.
 
 CREATE TABLE IF NOT EXISTS step_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,6 +90,9 @@ class EpisodeEnd:
     total_reward: float
     steps: int
     death_count: int
+    shots_fired: int = 0
+    kills: int = 0
+    accuracy: float = 0.0
     end_time: float = field(default_factory=time.time)
 
 
@@ -160,12 +166,17 @@ class MemorySystem:
         ))
         return self._episode_id
 
-    def end_episode(self, total_reward: float, steps: int, death_count: int) -> None:
+    def end_episode(self, total_reward: float, steps: int, death_count: int,
+                    combat: Optional[Dict[str, Any]] = None) -> None:
+        combat = combat or {}
         self._queue.put(EpisodeEnd(
             episode_id=self._episode_id,
             total_reward=total_reward,
             steps=steps,
             death_count=death_count,
+            shots_fired=int(combat.get("shots_fired", 0)),
+            kills=int(combat.get("kills", 0)),
+            accuracy=float(combat.get("accuracy", 0.0)),
         ))
 
     def log_step(self, step: int, action: List[int], reward: float, hud: Dict) -> None:
@@ -244,6 +255,15 @@ class MemorySystem:
     def _init_schema(self) -> None:
         conn = sqlite3.connect(self._db_path)
         conn.executescript(_SCHEMA)
+        # Retrofit combat columns into DBs created before they existed.
+        # SQLite has no ADD COLUMN IF NOT EXISTS, so catch the duplicate error.
+        for col, typedef in (("shots_fired", "INTEGER DEFAULT 0"),
+                             ("kills",       "INTEGER DEFAULT 0"),
+                             ("accuracy",    "REAL DEFAULT 0")):
+            try:
+                conn.execute(f"ALTER TABLE episodes ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass   # column already exists
         conn.commit()
         conn.close()
 
@@ -283,8 +303,10 @@ class MemorySystem:
                         )
                     elif isinstance(item, EpisodeEnd):
                         conn.execute(
-                            "UPDATE episodes SET end_time=?, total_reward=?, steps=?, death_count=? WHERE id=?",
-                            (item.end_time, item.total_reward, item.steps, item.death_count, item.episode_id),
+                            "UPDATE episodes SET end_time=?, total_reward=?, steps=?, death_count=?, "
+                            "shots_fired=?, kills=?, accuracy=? WHERE id=?",
+                            (item.end_time, item.total_reward, item.steps, item.death_count,
+                             item.shots_fired, item.kills, item.accuracy, item.episode_id),
                         )
                     elif isinstance(item, StepEvent):
                         # Convert each action element to a plain Python int before

@@ -547,3 +547,35 @@ git checkout -b feature/my-change
 git push -u origin HEAD
 # open a PR against main
 ```
+
+---
+
+## Performance notes (2026-10 optimization pass)
+
+Measured with `python benchmarks/benchmark.py` (baseline frozen at
+`runs/benchmark_baseline.json`; latest run in `runs/benchmark_*.json`):
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| OCR ammo read (p50) | 11.1 ms | 0.36 ms | **-97%** (digit allowlist + skip-unchanged) |
+| Perception tick (p50) | 39.6 ms | 36.6 ms | -8% |
+| Sim decision rate | 15.3 Hz | 17.6 Hz | **+15%** |
+
+Structural changes behind the numbers:
+
+- **YOLO** runs at `imgsz=640` with FP16 on CUDA + warmup at startup
+  (config: `perception.yolo_imgsz` / `yolo_half` / `yolo_device`).
+- **Perception** now runs on a dedicated worker thread (`perception_worker.py`)
+  publishing into `SharedState` — the RL step loop never blocks on vision.
+- **LLM advisor**: static instructions moved to a cached `system` block
+  (Anthropic prompt caching — watch `cache_read` in the consult log line),
+  structured output via tool-use instead of text parsing, stage-ranked tips,
+  chapter inference, and a two-tier model split (`llm_settings.fast_model`
+  for routine consults, `claude_model` for combat/low-health escalations).
+- **environment.py** decomposed into `env/obs_builder.py`, `env/rewards.py`,
+  `env/death_detection.py` — obs/action spaces unchanged (verified against
+  `sim_environment.py`).
+- **Config** is parsed once by `config_loader.py` and shared; `constants.py`
+  is the single source of truth for the action-space sizes.
+- **Combat metrics** (`combat_metrics.py`) track accuracy/efficiency/kills per
+  episode → SQLite `episodes` table → new ⚔️ Combat dashboard tab.

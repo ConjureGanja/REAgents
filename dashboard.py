@@ -206,6 +206,22 @@ class AgentDashboard:
                     reward_plot = gr.Plot(label="Reward History")
                     length_plot = gr.Plot(label="Episode Length")
 
+                # ── Tab 3b: Combat ───────────────────────────────────────────
+                # Rolling combat stats from combat_metrics.py (via MemoryCallback)
+                # — the Combat-stage KPIs from NEXT_STEPS.md: accuracy, ammo
+                # efficiency, kills.  Empty until the first episode completes.
+                with gr.Tab("⚔️ Combat"):
+                    with gr.Row():
+                        acc_box   = gr.Number(label="Accuracy (kills/shot, 10-ep avg)", interactive=False)
+                        eff_box   = gr.Number(label="Efficiency (dmg dealt/taken)",    interactive=False)
+                        kills_box = gr.Number(label="Kills per episode (10-ep avg)",   interactive=False)
+                        shots_box = gr.Number(label="Shots per episode (10-ep avg)",   interactive=False)
+                        tkills_box = gr.Number(label="Total kills (all episodes)",     interactive=False)
+                    gr.Markdown(
+                        "_Targets: accuracy ↑ toward 0.5+, efficiency > 1.0, "
+                        "kills/ep > 3 during the combat stage._"
+                    )
+
                 # ── Tab 4: Memory ────────────────────────────────────────────
                 with gr.Tab("💾 Memory"):
                     with gr.Row():
@@ -283,6 +299,11 @@ class AgentDashboard:
                     reward_plot, length_plot,
                 ],
             )
+            timer.tick(
+                fn=self._refresh_combat,
+                inputs=[],
+                outputs=[acc_box, eff_box, kills_box, shots_box, tkills_box],
+            )
 
             # FAST timer: streams ONLY the live video frame + cheap HUD fields so
             # the game view updates ~10×/sec instead of 1×/sec.  It deliberately
@@ -353,6 +374,23 @@ class AgentDashboard:
         )
 
     # ── Refresh callbacks ─────────────────────────────────────────────────────
+
+    def _refresh_combat(self) -> Tuple:
+        """Combat tab: rolling accuracy/efficiency/kills from combat_metrics."""
+        try:
+            stats = self._shared.get_snapshot().get("combat_stats") or {}
+            if not stats:
+                return 0.0, 0.0, 0.0, 0.0, 0.0
+            return (
+                round(float(stats.get("mean_accuracy", 0.0)), 3),
+                round(float(stats.get("mean_efficiency", 0.0)), 3),
+                round(float(stats.get("mean_kills", 0.0)), 2),
+                round(float(stats.get("mean_shots", 0.0)), 1),
+                float(stats.get("total_kills", 0)),
+            )
+        except Exception as exc:
+            logger.debug("Combat refresh error: %s", exc)
+            return 0.0, 0.0, 0.0, 0.0, 0.0
 
     def _refresh_image(self) -> Tuple:
         """

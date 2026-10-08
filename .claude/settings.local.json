@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(file /v/AI-ML/REAgents/RE_AI_Agent_Spec.*)"
+      "Bash(file /v/AI-ML/REAgents/RE_AI_Agent_Spec.*)",
+      "PowerShell(Get-Process *)",
+      "Bash(C:/Users/wizar/miniconda3/envs/re_agent/python.exe -c \"import time; time.sleep\\(12\\)\")",
+      "Bash(netstat -ano)",
+      "Bash(C:/Users/wizar/miniconda3/envs/re_agent/python.exe *)",
+      "Bash(/c/Users/wizar/miniconda3/envs/re_agent/python.exe -m py_compile main.py environment.py)"
     ]
   }
 }

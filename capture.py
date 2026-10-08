@@ -38,9 +38,9 @@ class ScreenCapture:
       who only glances at the camera once they've finished their paperwork.
     """
 
-    def __init__(self, config_path: str = "config.yaml"):
-        with open(config_path, "r") as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self, config_path: str = "config.yaml", config: Optional[dict] = None):
+        from config_loader import ensure_config
+        self.config = ensure_config(config, config_path)
 
         game_cfg = self.config["game_settings"]
         monitor_idx = game_cfg.get("monitor_index", 1)
@@ -108,17 +108,25 @@ class ScreenCapture:
 
     # ── Public frame access ───────────────────────────────────────────────────
 
-    def get_frame(self) -> np.ndarray:
+    def get_frame(self, copy: bool = False) -> np.ndarray:
         """
         Return the most recent captured frame (BGR NumPy array) instantly.
 
         Falls back to a direct grab if the background thread hasn't produced a
         frame yet, and to a black frame only if even that fails — so callers
         always receive a valid array.
+
+        OWNERSHIP RULE (copy=False, the default):
+          The returned array is the grabber's current buffer.  The capture
+          thread REPLACES (never mutates) it each tick, so a reader always sees
+          one consistent frame — but you must NOT draw on it.  Callers that
+          annotate in place must pass copy=True or .copy() it themselves.
+          (Dashboard/recorder already copy; the env never mutates.)  This
+          removes a full 6 MB 1080p memcpy from every hot-path read.
         """
         with self._latest_lock:
             if self._latest is not None:
-                return self._latest.copy()
+                return self._latest.copy() if copy else self._latest
         # Thread not warmed up yet — grab directly this once.
         try:
             sct_img = self.sct.grab(self.monitor)

@@ -38,6 +38,10 @@ class SharedState:
     # ── YOLO detections from perception system ────────────────────────────────
     detections: List[Dict] = field(default_factory=list)
 
+    # ── Perception worker outputs (perception_worker.py) ──────────────────────
+    death_screen: bool = False      # "YOU ARE DEAD" screen heuristic
+    perception_at: float = 0.0      # time.time() of last fresh perception publish
+
     # ── LLM outputs ───────────────────────────────────────────────────────────
     gpt_analysis: str = ""
     claude_plan: str = ""
@@ -58,6 +62,10 @@ class SharedState:
     # ── Last RL action and reward ─────────────────────────────────────────────
     current_action: List[int] = field(default_factory=lambda: [0, 0, 0, 0, 0, 0])
     last_reward: float = 0.0
+
+    # ── Combat metrics (combat_metrics.py via MemoryCallback) ────────────────
+    # Rolling accuracy/efficiency/kills for the dashboard's Combat panel.
+    combat_stats: Dict[str, Any] = field(default_factory=dict)
 
     # ── Control flags ─────────────────────────────────────────────────────────
     is_training: bool = False
@@ -135,6 +143,7 @@ class SharedState:
                 "claude_plan": self.claude_plan,
                 "grok_tactical": self.grok_tactical,
                 "llm_objective": self.llm_objective,
+                "combat_stats": dict(self.combat_stats),
                 "episode_count": self.episode_count,
                 "total_steps": self.total_steps,
                 "episode_reward": self.episode_reward,
