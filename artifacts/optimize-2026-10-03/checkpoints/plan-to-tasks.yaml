@@ -1,0 +1,72 @@
+# plan-to-tasks traceability checkpoint
+# Generated: 2026-10-03
+
+plan_items:
+  - id: P1.1
+    title: Benchmark harness
+    tasks: ["T001", "T003"]
+  - id: P1.2
+    title: GPU sanity check
+    tasks: ["T002"]
+  - id: P2.1
+    title: Central config loader
+    tasks: ["T004", "T006"]
+  - id: P2.2
+    title: Shared action-space constant
+    tasks: ["T007"]
+  - id: P2.3
+    title: Game-profile merge loader
+    tasks: ["T005"]
+  - id: P3.1
+    title: YOLO inference speedup
+    tasks: ["T008", "T009"]
+  - id: P3.2
+    title: OCR optimization
+    tasks: ["T010"]
+  - id: P3.3
+    title: Perception worker thread
+    tasks: ["T011", "T012"]
+  - id: P3.4
+    title: LLM prompt caching + system block
+    tasks: ["T013"]
+  - id: P3.5
+    title: Capture hot-path copy removal
+    tasks: ["T014"]
+  - id: P4.1
+    title: Structured LLM outputs (tool-use)
+    tasks: ["T015"]
+  - id: P4.2
+    title: Prompt context budget
+    tasks: ["T016", "T017"]
+  - id: P4.3
+    title: Two-tier LLM advisor
+    tasks: ["T018"]
+  - id: P5.1
+    title: Decompose environment.py
+    tasks: ["T019", "T020", "T021", "T022"]
+  - id: P5.2
+    title: Remove MultiModelLLM alias
+    tasks: ["T023"]
+  - id: P6.1
+    title: Combat metrics
+    tasks: ["T024", "T025", "T026"]
+  - id: P7.1
+    title: Benchmark comparison
+    tasks: ["T027"]
+  - id: P7.2
+    title: Contract regression checks
+    tasks: ["T028", "T029"]
+
+coverage:
+  total_plan_items: 18
+  mapped: 18
+  unmapped: []
+  total_tasks: 29
+
+execution_notes:
+  parallelizable: ["T002", "T007", "T009", "T014", "T017", "T023", "T026", "T028"]
+  ordering_constraints:
+    - "T001..T003 (baseline) must complete before T008..T014 so gains are measurable"
+    - "T004..T006 (config loader) should precede T008+ so new keys flow through one loader"
+    - "T013 should precede T015/T016/T018 (all touch _build_prompt/_call)"
+    - "T019..T021 must land together with T022 (contract verification)"

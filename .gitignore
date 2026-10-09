@@ -24,6 +24,7 @@ data/
 logs/
 *.log
 tensorboard/
+runs/
 
 # Temporary files
 *.yaml.tmp
@@ -35,11 +36,17 @@ footage/
 *.mp4
 *.avi
 
-# IDE
+# Debug / local capture dumps
+debug_capture.png
+*.png.bak
+
+# IDE / local agent settings
 .vscode/
 .idea/
 *.iml
+.claude/settings.local.json
 
 # OS
 .DS_Store
 Thumbs.db
+

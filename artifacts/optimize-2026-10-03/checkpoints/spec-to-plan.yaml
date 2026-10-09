@@ -1,0 +1,73 @@
+# spec-to-plan traceability checkpoint
+# Generated: 2026-10-03
+# NOTE: No upstream REQ-XXX spec existed; requirements were derived from code
+# analysis of V:\AI-ML\REAgents and the user's four optimization goals
+# (performance, code quality, prompts, features). See plan.md "Note on process
+# deviation".
+
+requirements:
+  - id: REQ-P1
+    source: "perception.py detect_objects — full 1080p frame through yolo11n at 10 Hz"
+    plan_items: ["P3.1"]
+    tasks: ["T008", "T009"]
+  - id: REQ-P2
+    source: "perception.py read_hud — unconstrained EasyOCR every perception tick"
+    plan_items: ["P3.2"]
+    tasks: ["T010"]
+  - id: REQ-P3
+    source: "environment.py step — ~150ms YOLO+OCR runs inline on the RL step loop"
+    plan_items: ["P3.3"]
+    tasks: ["T011", "T012"]
+  - id: REQ-P4
+    source: "llm_agent.py — identical static prompt sections re-sent and re-billed every consult"
+    plan_items: ["P3.4"]
+    tasks: ["T013"]
+  - id: REQ-P5
+    source: "capture.py get_frame — full-frame .copy() on every hot read"
+    plan_items: ["P3.5"]
+    tasks: ["T014"]
+  - id: REQ-Q1
+    source: "environment.py ~1000-line god object (obs, reward, death logic interleaved)"
+    plan_items: ["P5.1"]
+    tasks: ["T019", "T020", "T021", "T022"]
+  - id: REQ-Q2
+    source: "llm_agent.py _ACTION_SPACE_SIZES duplicates env MultiDiscrete([9,5,2,4,3,2])"
+    plan_items: ["P2.2"]
+    tasks: ["T007"]
+  - id: REQ-Q3
+    source: "config.yaml re-parsed in environment.py, perception.py, capture.py, llm_agent.py, main.py"
+    plan_items: ["P2.1"]
+    tasks: ["T004", "T006"]
+  - id: REQ-Q4
+    source: "llm_agent.py MultiModelLLM backward-compat alias"
+    plan_items: ["P5.2"]
+    tasks: ["T023"]
+  - id: REQ-R1
+    source: "llm_agent.py _parse_response — brittle line-prefix parsing of free text"
+    plan_items: ["P4.1"]
+    tasks: ["T015"]
+  - id: REQ-R2
+    source: "llm_agent.py _build_prompt — static instructions embedded in user message"
+    plan_items: ["P4.2", "P3.4"]
+    tasks: ["T013", "T016"]
+  - id: REQ-R3
+    source: "llm_agent.py — hardcoded first-4-chapters and first-6-tips truncation"
+    plan_items: ["P4.2"]
+    tasks: ["T016", "T017"]
+  - id: REQ-F1
+    source: "NEXT_STEPS.md §1.3 — combat_metrics.py specified but never created"
+    plan_items: ["P6.1"]
+    tasks: ["T024", "T025", "T026"]
+  - id: REQ-F2
+    source: "config.yaml game_profiles — declarative scaffolding, loader never implemented"
+    plan_items: ["P2.3"]
+    tasks: ["T005"]
+  - id: REQ-F3
+    source: "llm_agent.py — every consult uses claude-sonnet-4-6 regardless of urgency"
+    plan_items: ["P4.3"]
+    tasks: ["T018"]
+
+coverage:
+  total_requirements: 15
+  mapped: 15
+  unmapped: []

@@ -158,6 +158,14 @@ class MemoryCallback(BaseCallback):
         self._ep_id  = 0
         self._step   = 0
 
+        # Combat metrics (combat_metrics.py): shots/kills/damage are derived
+        # from step-over-step HUD deltas — no game-memory reading required.
+        from combat_metrics import CombatLogger
+        self._combat        = CombatLogger()
+        self._prev_clip     = 0
+        self._prev_enemies  = 0
+        self._prev_hp: Optional[float] = None
+
     def _on_training_start(self) -> None:
         self._ep_id = self._memory.start_episode(curriculum=self._shared.curriculum_stage)
 
@@ -178,21 +186,58 @@ class MemoryCallback(BaseCallback):
             if d.get("label") in ("person", "zombie", "enemy")
         )
 
+        # ── Combat deltas ─────────────────────────────────────────────────────
+        clip = int(hud.get("ammo_clip", 0) or 0)
+        if 0 < clip < self._prev_clip:
+            self._combat.log_shot(self._prev_clip - clip)
+        self._prev_clip = clip
+
+        enemies_now = hud["enemy_count"]
+        if enemies_now < self._prev_enemies and self._combat.shot_recently():
+            self._combat.log_kill(self._prev_enemies - enemies_now)
+        self._prev_enemies = enemies_now
+
+        hp = hud.get("health_pct")
+        if hp is not None and self._prev_hp is not None:
+            drop = self._prev_hp - float(hp)
+            # Ignore implausible drops — same misread guard as the env's
+            # death detection (max 50% per step is real damage).
+            if 0.0 < drop <= 0.5:
+                self._combat.log_damage(drop, is_player=True)
+        if hp is not None and float(hp) > 0.0:
+            self._prev_hp = float(hp)
+
         if self._step % 10 == 0:
             self._memory.log_step(self._step, action, reward, hud)
 
         info = infos[0] if infos else {}
         if "episode" in info:
             ep = info["episode"]
+            final = self._combat.finalize_episode()
             self._memory.end_episode(
                 total_reward=ep.get("r", 0.0),
                 steps=ep.get("l", 0),
-                death_count=ep.get("deaths", 0),
+                # Monitor replaces info["episode"] with its own dict, wiping the
+                # env's "deaths" key — read the top-level "death_count" the env
+                # now also sets (falls back to the old key for compatibility).
+                death_count=info.get("death_count", ep.get("deaths", 0)),
+                combat={
+                    "shots_fired": final.shots_fired,
+                    "kills":       final.kills,
+                    "accuracy":    final.accuracy,
+                },
             )
+            # Publish rolling combat stats for the dashboard Combat panel.
+            rolling = self._combat.get_rolling_stats()
+            if rolling:
+                self._shared.update(combat_stats=rolling)
             self._ep_id = self._memory.start_episode(
                 curriculum=self._shared.curriculum_stage
             )
             self._step = 0
+            self._prev_clip = 0
+            self._prev_enemies = 0
+            self._prev_hp = None
         else:
             self._step += 1
 
@@ -269,14 +314,15 @@ class RETrainer:
         shared: Optional[SharedState] = None,
         memory: Optional[MemorySystem] = None,
         consultant=None,   # Optional[LLMConsultant] — kept as Any to avoid import cycles
+        config: Optional[dict] = None,
     ):
         # Store the path so build() can pass it to ResidentEvilEnv.
         # Without this, build() was hardcoding "config.yaml" and ignoring any
         # --config flag the user passed on the command line.
         self._config_path = config_path
 
-        with open(config_path) as f:
-            self._cfg = yaml.safe_load(f)
+        from config_loader import ensure_config
+        self._cfg = ensure_config(config, config_path)
 
         self._shared     = shared or SharedState()
         self._memory     = memory or MemorySystem(self._cfg["storage"]["db_path"])
@@ -308,10 +354,12 @@ class RETrainer:
         Analogy: like converting temperatures to Celsius so the scale is always
         interpretable, regardless of whether you're in Iceland or the Sahara.
         """
-        self._base_env = ResidentEvilEnv(config_path=self._config_path, shared_state=self._shared)
+        self._base_env = ResidentEvilEnv(config=self._cfg, shared_state=self._shared)
 
         monitored = Monitor(self._base_env)
         raw_env   = DummyVecEnv([lambda: monitored])
+        # Kept so load_checkpoint() can re-wrap it with restored VecNormalize stats.
+        self._raw_env = raw_env
 
         # Optional reward normalisation (recommended — reduces training variance)
         use_vecnorm = self._rl_cfg.get("use_vec_normalize", True)
@@ -337,15 +385,47 @@ class RETrainer:
         )
 
     def load_checkpoint(self, path: str) -> None:
-        """Resume training from a saved .zip checkpoint."""
+        """
+        Resume training from a saved .zip checkpoint.
+
+        Also restores the sibling `<name>_vecnorm.pkl` (VecNormalize running
+        reward stats) if present.  Resuming a policy with RESET normalisation
+        stats rescales every reward the value function sees — that mismatch is
+        what collapsed the June 28 sim run.
+
+        A corrupt/unreadable checkpoint no longer kills the trainer thread —
+        we log the error and continue with the freshly built model instead.
+        """
         algo = self._rl_cfg.get("algorithm", "RecurrentPPO")
         cls  = self._get_model_cls(algo)
-        self._model = cls.load(
-            path,
-            env=self._env,
-            tensorboard_log=self._storage["tensorboard_dir"],
-        )
-        logger.info("Resumed from checkpoint: %s", path)
+
+        # 1. Restore VecNormalize stats if a sibling pkl exists.
+        try:
+            norm_path = Path(path).with_name(Path(path).stem + "_vecnorm.pkl")
+            if norm_path.exists() and isinstance(self._env, VecNormalize):
+                self._env = VecNormalize.load(str(norm_path), self._raw_env)
+                self._env.training = True
+                logger.info("VecNormalize stats restored from %s", norm_path)
+        except Exception as exc:
+            logger.warning("VecNormalize restore failed (%s) — continuing with fresh stats.", exc)
+
+        # 2. Load the model itself.
+        try:
+            self._model = cls.load(
+                path,
+                env=self._env,
+                tensorboard_log=self._storage["tensorboard_dir"],
+            )
+            logger.info("Resumed from checkpoint: %s", path)
+        except Exception as exc:
+            logger.error(
+                "Could not load checkpoint %s (%s) — the file may be corrupt "
+                "(e.g. an interrupted save). Continuing with a FRESH model.",
+                path, exc,
+            )
+            # Re-point the already-built fresh model at the (possibly re-wrapped) env.
+            if self._model is not None:
+                self._model.set_env(self._env)
 
     def train(self) -> None:
         if self._model is None or self._env is None:
@@ -363,8 +443,21 @@ class RETrainer:
             )
         finally:
             self._shared.update(is_training=False)
+            # Neutralise the gamepad — sticks/triggers now persist across steps,
+            # so without this an interrupted run would leave Leon walking into a
+            # wall until the process exits.
+            try:
+                if self._base_env is not None and hasattr(self._base_env, "_ctrl"):
+                    self._base_env._ctrl.release_all()
+                    logger.info("Gamepad released — all axes/buttons neutralised.")
+            except Exception as exc:
+                logger.warning("Gamepad release on stop failed (non-fatal): %s", exc)
+            # Atomic save: write to a temp file then rename, so an interrupted
+            # save can never leave a truncated (corrupt) re_agent_final.zip.
             final_path = Path(self._storage["checkpoint_dir"]) / "re_agent_final.zip"
-            self._model.save(str(final_path))
+            tmp_path   = final_path.with_name(final_path.stem + ".tmp.zip")
+            self._model.save(str(tmp_path))
+            os.replace(tmp_path, final_path)
 
             # If VecNormalize is active, save its running stats too so they can
             # be restored when resuming — otherwise the first steps after resume
@@ -421,10 +514,19 @@ class RETrainer:
             policy_kwargs["lstm_hidden_size"] = self._rl_cfg.get("lstm_hidden_size", 256)
             policy_kwargs["n_lstm_layers"]    = self._rl_cfg.get("n_lstm_layers", 1)
 
+        # Learning-rate schedule — "linear" decays to 0 over the run, which
+        # stabilises late training; "constant" preserves the old behaviour.
+        lr_value = float(self._rl_cfg.get("learning_rate", 2.5e-4))
+        if str(self._rl_cfg.get("lr_schedule", "constant")).lower() == "linear":
+            learning_rate = lambda progress_remaining: lr_value * progress_remaining
+        else:
+            learning_rate = lr_value
+
         model = cls(
             policy=policy,
             env=self._env,
-            learning_rate=self._rl_cfg.get("learning_rate", 2.5e-4),
+            learning_rate=learning_rate,
+            target_kl=self._rl_cfg.get("target_kl", None),
             n_steps=self._rl_cfg.get("n_steps", 512),
             batch_size=self._rl_cfg.get("batch_size", 128),
             n_epochs=self._rl_cfg.get("n_epochs", 4),

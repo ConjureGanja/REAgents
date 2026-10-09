@@ -130,7 +130,8 @@ class SimDashboardCallback(BaseCallback):
                 self._ep_rewards[i] = 0.0
                 self._ep_lengths[i] = 0
 
-                # Track episode count per worker
+                # Episode count is tracked below; keep last worker snapshot/reward intact.
+                # Also increment episode counter safely via SharedState
                 with self._shared._lock:
                     while len(self._shared.worker_episodes) <= i:
                         self._shared.worker_episodes.append(0)
@@ -194,8 +195,12 @@ class SimMemoryCallback(BaseCallback):
         return True
 
     def _on_training_end(self) -> None:
-        for ep_id in self._ep_ids.values():
-            self._memory.end_episode(0.0, 0, 0)
+        """Clean up any open episodes on training end to avoid DB leaks."""
+        for ep_id in list(self._ep_ids.values()):
+            try:
+                self._memory.end_episode(0.0, 0, 0)
+            except Exception as e:
+                logger.warning("Failed to end episode %s on training end: %s", ep_id, e)
 
 
 class SimCurriculumCallback(BaseCallback):
@@ -369,8 +374,9 @@ class SimRETrainer:
             self._n_workers * self._rl_cfg.get("n_steps", 512),
         )
 
-        # Initialise SharedState worker slots — CRITICAL: all 4 lists must be pre-sized
-        # to avoid IndexError when workers report at different rates
+        # Initialise SharedState worker slots to exact size.
+        # This prevents "list assignment index out of range" when callbacks
+        # fire during/after VecNormalize or at training end.
         self._shared.update(
             worker_snapshots=[{}] * self._n_workers,
             worker_rewards=[0.0] * self._n_workers,
@@ -510,6 +516,7 @@ class SimRETrainer:
         cbs = [checkpoint_cb, dashboard_cb, memory_cb, curric_cb]
 
         if self._consultant is not None:
+            # Import LLMCallback from trainer.py (it works with simulation)
             from trainer import LLMCallback
             llm_cfg = self._cfg.get("llm_settings", {})
             cbs.append(LLMCallback(

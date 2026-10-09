@@ -107,11 +107,12 @@ def _annotate_frame(frame: Optional[np.ndarray], detections: List[Dict], hud: Di
         cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(annotated, label, (x1, max(y1-6, 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-    # HUD overlay
-    hp  = float(hud.get("health_pct", 1.0))
+    # HUD overlay (health_pct is None while the ring isn't visible)
+    _hp  = hud.get("health_pct", None)
+    hp_txt = f"{float(_hp):.0%}" if _hp is not None else "--"
     clip = hud.get("ammo_clip", "?")
     res  = hud.get("ammo_res",  "?")
-    cv2.putText(annotated, f"HP: {hp:.0%}  Ammo: {clip}/{res}",
+    cv2.putText(annotated, f"HP: {hp_txt}  Ammo: {clip}/{res}",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     return cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
 
@@ -205,6 +206,22 @@ class AgentDashboard:
                     reward_plot = gr.Plot(label="Reward History")
                     length_plot = gr.Plot(label="Episode Length")
 
+                # ── Tab 3b: Combat ───────────────────────────────────────────
+                # Rolling combat stats from combat_metrics.py (via MemoryCallback)
+                # — the Combat-stage KPIs from NEXT_STEPS.md: accuracy, ammo
+                # efficiency, kills.  Empty until the first episode completes.
+                with gr.Tab("⚔️ Combat"):
+                    with gr.Row():
+                        acc_box   = gr.Number(label="Accuracy (kills/shot, 10-ep avg)", interactive=False)
+                        eff_box   = gr.Number(label="Efficiency (dmg dealt/taken)",    interactive=False)
+                        kills_box = gr.Number(label="Kills per episode (10-ep avg)",   interactive=False)
+                        shots_box = gr.Number(label="Shots per episode (10-ep avg)",   interactive=False)
+                        tkills_box = gr.Number(label="Total kills (all episodes)",     interactive=False)
+                    gr.Markdown(
+                        "_Targets: accuracy ↑ toward 0.5+, efficiency > 1.0, "
+                        "kills/ep > 3 during the combat stage._"
+                    )
+
                 # ── Tab 4: Memory ────────────────────────────────────────────
                 with gr.Tab("💾 Memory"):
                     with gr.Row():
@@ -268,8 +285,8 @@ class AgentDashboard:
                     ctrl_status = gr.Textbox(label="", interactive=False, lines=3)
 
             # ── Timer-driven auto-refresh ────────────────────────────────────
+            # SLOW timer (1 s): plots, LLM text, counters — expensive to rebuild.
             timer = gr.Timer(value=1.0)
-
             timer.tick(
                 fn=self._refresh_live,
                 inputs=[],
@@ -281,6 +298,22 @@ class AgentDashboard:
                     ep_count, total_st, best_rew, deaths, stage_box,
                     reward_plot, length_plot,
                 ],
+            )
+            timer.tick(
+                fn=self._refresh_combat,
+                inputs=[],
+                outputs=[acc_box, eff_box, kills_box, shots_box, tkills_box],
+            )
+
+            # FAST timer: streams ONLY the live video frame + cheap HUD fields so
+            # the game view updates ~10×/sec instead of 1×/sec.  It deliberately
+            # does NOT touch the Plotly charts (those stay on the 1 s timer) so we
+            # get a smooth feed without rebuilding plots on every tick.
+            img_timer = gr.Timer(value=0.1)   # 10 fps dashboard video
+            img_timer.tick(
+                fn=self._refresh_image,
+                inputs=[],
+                outputs=[live_img, health_slider, ammo_box, action_box, reward_box],
             )
 
             # ── Memory tab refresh ───────────────────────────────────────────
@@ -342,6 +375,42 @@ class AgentDashboard:
 
     # ── Refresh callbacks ─────────────────────────────────────────────────────
 
+    def _refresh_combat(self) -> Tuple:
+        """Combat tab: rolling accuracy/efficiency/kills from combat_metrics."""
+        try:
+            stats = self._shared.get_snapshot().get("combat_stats") or {}
+            if not stats:
+                return 0.0, 0.0, 0.0, 0.0, 0.0
+            return (
+                round(float(stats.get("mean_accuracy", 0.0)), 3),
+                round(float(stats.get("mean_efficiency", 0.0)), 3),
+                round(float(stats.get("mean_kills", 0.0)), 2),
+                round(float(stats.get("mean_shots", 0.0)), 1),
+                float(stats.get("total_kills", 0)),
+            )
+        except Exception as exc:
+            logger.debug("Combat refresh error: %s", exc)
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    def _refresh_image(self) -> Tuple:
+        """
+        Lightweight high-frequency refresh — just the annotated game frame and
+        the cheap HUD readouts.  Runs ~10×/sec so the live view looks like video.
+        Deliberately avoids any plot/LLM/DB work so it stays fast.
+        """
+        try:
+            snap = self._shared.get_snapshot()
+            img      = _annotate_frame(snap["frame"], snap["detections"], snap["hud"])
+            hud      = snap["hud"]
+            health   = float(hud.get("health_pct", 1.0) or 0.0)
+            ammo_txt = f"{hud.get('ammo_clip','?')} / {hud.get('ammo_res','?')}"
+            act_txt  = _action_to_readable(snap["current_action"])
+            rew_txt  = f"{snap['last_reward']:+.3f}"
+            return img, health, ammo_txt, act_txt, rew_txt
+        except Exception as exc:
+            logger.debug("Image refresh error: %s", exc)
+            return None, 1.0, "? / ?", "", "+0.000"
+
     def _refresh_live(self) -> Tuple:
         try:
             snap = self._shared.get_snapshot()
@@ -359,10 +428,11 @@ class AgentDashboard:
                 status = "🔴 **Idle**"
 
             focus_warn = ""
-            if not snap.get("game_focused", True) and snap["is_training"] and not snap.get("paused", False):
+            auto_pause = snap.get("auto_pause_on_focus_loss", False)
+            if auto_pause and not snap.get("game_focused", True) and snap["is_training"] and not snap.get("paused", False):
                 focus_warn = "   ⚠️ **GAME NOT FOCUSED** — click RE4 window to resume"
 
-            auto_tag = "🔒 auto-pause ON" if snap.get("auto_pause_on_focus_loss", True) else "🔓 auto-pause OFF"
+            auto_tag = "🔒 auto-pause ON" if auto_pause else "🔓 gamepad mode — focus not required"
             status_md = (
                 f"**Status:** {status}   "
                 f"**Stage:** `{snap['curriculum_stage']}`   "
@@ -372,7 +442,8 @@ class AgentDashboard:
             img = _annotate_frame(snap["frame"], snap["detections"], snap["hud"])
 
             hud      = snap["hud"]
-            health   = float(hud.get("health_pct", 1.0))
+            _hp_raw  = hud.get("health_pct", None)
+            health   = float(_hp_raw) if _hp_raw is not None else 1.0
             ammo_txt = f"{hud.get('ammo_clip','?')} / {hud.get('ammo_res','?')}"
 
             act_txt = _action_to_readable(snap["current_action"])
@@ -427,10 +498,15 @@ class AgentDashboard:
             return "Already training."
         # Clear paused flag so training doesn't immediately freeze on start
         self._shared.update(stop_requested=False, is_training=True, paused=False)
+        logging.getLogger("dashboard").info("START button pressed — training enabled.")
         return "▶ Training started."
 
     def _handle_stop(self) -> str:
         self._shared.update(stop_requested=True, paused=False)
+        logging.getLogger("dashboard").warning(
+            "STOP button pressed — stop_requested set; training will halt after "
+            "the current rollout."
+        )
         return "⏹ Stop requested — will complete current rollout then halt."
 
     def _handle_force_llm(self) -> str:

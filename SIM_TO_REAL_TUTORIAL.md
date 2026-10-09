@@ -197,8 +197,9 @@ Same controls but with **training-preset domain randomization on**. The visuals 
 
 ### Step 3.1 — Launch the shake-down
 
-```bat
-python train_sim_complete.py --timesteps 200_000 --eval-every 25_000
+```bash
+# Fixed & improved version (no more IndexError on end)
+python train_sim_complete.py --timesteps 20000 --eval-every 5000 --no-llm
 ```
 
 What to watch in the terminal:
@@ -234,8 +235,9 @@ If the shake-down looks good (any upward trend in reward + at least one bell/sho
 
 ### Step 4.1 — Kick it off
 
-```bat
-python train_sim_complete.py --timesteps 2_000_000 --eval-every 50_000 --run-name village_v1
+```bash
+# Recommended full run (uses improved sim_trainer)
+python train_sim_complete.py --timesteps 600000 --eval-every 50000 --eval-episodes 20
 ```
 
 `--run-name village_v1` puts outputs in `runs/village_v1/` instead of a timestamp folder — easier to refer back to.

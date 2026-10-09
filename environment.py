@@ -49,10 +49,21 @@ from capture import ScreenCapture
 from controls import GameControls
 from perception import PerceptionSystem
 from shared_state import SharedState
+from constants import ACTION_SPACE_SIZES
+from env.obs_builder import ObsBuilder
+from env.death_detection import DeathDetector
+from env.rewards import RewardCalculator, RewardInputs
 
 logger = logging.getLogger(__name__)
 
-# ── Curriculum reward weights ──────────────────────────────────────────────────
+# ── Curriculum reward weights (FALLBACK defaults) ─────────────────────────────
+# These are only used when config.yaml doesn't provide per-stage reward_weights.
+# config.yaml promises "edit this file to tune the agent without touching any
+# Python code" — previously these hardcoded values silently OVERRODE the config,
+# so tuning curriculum.stages.*.reward_weights did nothing.  Now the config wins
+# and this dict is the safety net.
+# Analogy: the config is the thermostat on the wall; this dict is the factory
+# default the furnace falls back to if the thermostat is unplugged.
 _CURRICULUM_WEIGHTS: Dict[str, Dict[str, float]] = {
     "exploration": {"survival": 0.6, "exploration": 2.5, "combat": 0.4, "objective": 1.0},
     "combat":      {"survival": 0.4, "exploration": 0.5, "combat": 2.5, "objective": 1.5},
@@ -76,18 +87,22 @@ class ResidentEvilEnv(gym.Env):
         self,
         config_path: str = "config.yaml",
         shared_state: Optional[SharedState] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
-        with open(config_path) as f:
-            self._cfg = yaml.safe_load(f)
+        from config_loader import ensure_config
+        self._cfg = ensure_config(config, config_path)
 
         self._shared = shared_state or SharedState()
 
         # ── Sub-systems ───────────────────────────────────────────────────────
-        self._cap  = ScreenCapture(config_path)
+        self._cap  = ScreenCapture(config=self._cfg)
         _win       = self._cfg["game_settings"].get("window_title_substring", "RESIDENT EVIL 4")
-        self._ctrl = GameControls(window_title_substring=_win)
-        self._eyes = PerceptionSystem(config_path)
+        self._ctrl = GameControls(
+            window_title_substring=_win,
+            smoothing=self._cfg.get("controls", {}).get("smoothing"),
+        )
+        self._eyes = PerceptionSystem(config=self._cfg)
 
         # ── Observation configuration ─────────────────────────────────────────
         rl_cfg = self._cfg["rl_hyperparameters"]
@@ -98,12 +113,11 @@ class ResidentEvilEnv(gym.Env):
         channels_per_frame    = 1 if self._grayscale else 3
 
         # Frame stacking — N frames concatenated along the channel axis
-        # Example: grayscale + stack=4 → (84, 84, 4)
-        #          RGB       + stack=4 → (84, 84, 12)
-        # This gives the CNN temporal information without a recurrent network.
+        # (grayscale+stack=4 → (84,84,4); RGB+stack=4 → (84,84,12)).
+        # The rolling buffer lives in env.obs_builder.ObsBuilder.
         self._stack_size: int = rl_cfg.get("frame_stack", 4)
         total_channels        = channels_per_frame * self._stack_size
-        self._frame_buffer: deque = deque(maxlen=self._stack_size)
+        self._obs_builder = ObsBuilder(self._obs_h, self._obs_w, self._grayscale, self._stack_size)
 
         # HUD has 7 elements (added ammo_delta_norm vs the original 6)
         self.observation_space = spaces.Dict({
@@ -115,22 +129,118 @@ class ResidentEvilEnv(gym.Env):
             "hud": spaces.Box(low=0.0, high=1.0, shape=(7,), dtype=np.float32),
         })
 
-        self.action_space = spaces.MultiDiscrete([9, 5, 2, 4, 3, 2])
+        self.action_space = spaces.MultiDiscrete(ACTION_SPACE_SIZES)
 
         # Action hold duration — how long each action is pressed
         self._action_hold = float(rl_cfg.get("action_hold_seconds", 0.08))
 
+        # ── Perception throttle ───────────────────────────────────────────────
+        # YOLO + EasyOCR together cost ~150 ms, far too slow to run every step.
+        # The raw frame is always fresh (threaded ScreenCapture), but the
+        # detections/HUD only need to refresh ~10×/sec.  We re-run perception at
+        # most every `perception_interval` seconds and reuse the cached result
+        # in between, so the decision loop can hit ≥20 fps.
+        _perc_fps = float(self._cfg["game_settings"].get("perception_fps", 10))
+        self._perception_interval = 1.0 / max(_perc_fps, 1.0)
+        self._last_perception_t   = 0.0
+        self._cached_detections: List[Dict] = []
+        self._cached_hud: Dict[str, Any]    = {"health_pct": 1.0, "ammo_clip": 0, "ammo_res": 0}
+
+        # Dedicated perception worker — runs YOLO/OCR/health/death-screen on a
+        # background thread and publishes into SharedState, so the step loop
+        # never blocks on the ~40-150 ms vision tick.  All PerceptionSystem
+        # access is serialized through this worker (YOLO/EasyOCR are not
+        # thread-safe); reset() and the startup fallback use read_sync().
+        from perception_worker import PerceptionWorker
+        self._perception_worker = PerceptionWorker(
+            eyes=self._eyes, cap=self._cap, shared=self._shared, fps=_perc_fps,
+        )
+        self._perception_worker.start()
+
         # Inventory cooldown — prevents Tab-spam (suitcase covers the whole screen)
         self._inv_cooldown: float = 12.0
+
+        # ── Death detection robustness ────────────────────────────────────────
+        # The health detector frequently misreads 0.0 when the HUD ring isn't
+        # visible (cutscenes, menus, dark frames, the binocular scene).  Trusting
+        # those zeros caused phantom deaths → 1-step episodes → an endless
+        # reset/Load-Game menu loop.  We therefore: (a) treat health 0.0/None as
+        # "HUD not visible / unknown" and hold the last good value rather than
+        # calling it death; (b) ignore implausibly large single-step health drops
+        # (a real hit can't take you from full to zero in one 0.04 s step); and
+        # (c) only declare death after health stays genuinely low for several
+        # consecutive steps, and never during a post-reset grace window.
+        # Death detection lives in env.death_detection.DeathDetector — it owns
+        # the health-validation state machine, the streak counters, and the
+        # post-reset grace window.  Config keys unchanged.
+        self._death = DeathDetector(
+            confirm_steps=int(rl_cfg.get("death_confirm_steps", 10)),
+            screen_reads=int(rl_cfg.get("death_screen_confirm_reads", 8)),
+            grace_steps=int(rl_cfg.get("reset_grace_steps", 15)),
+            max_plausible_drop=float(rl_cfg.get("max_plausible_health_drop", 0.5)),
+            low_health_thresh=float(rl_cfg.get("low_health_threshold", 0.12)),
+        )
+        self._cached_death_screen = False
+        self._perception_fresh    = False
+
+        # Enemy latch — the aim/shoot gate used to check only the PREVIOUS
+        # frame's YOLO detections, so a single missed detection strobed combat
+        # off mid-fight.  Now an enemy sighting stays "hot" for a few seconds.
+        self._enemy_latch_s: float = float(rl_cfg.get("enemy_latch_seconds", 3.0))
+        self._last_enemy_seen_t: float = 0.0
+        self._last_shot_t: float = 0.0
+        self._llm_steering: bool = False
+
+        # ── LLM action override persistence ───────────────────────────────────
+        # Claude consults only every few seconds, but its movement override used
+        # to be applied for a SINGLE 0.04 s step and then discarded — so "sprint
+        # north to the shotgun house" made Leon twitch for one frame and stop,
+        # never actually navigating.  We now latch a fresh override and re-apply
+        # it for `override_hold_steps` steps so the advisor can genuinely steer.
+        self._override_hold = int(
+            self._cfg.get("llm_settings", {}).get("override_hold_steps", 20)
+        )
+        self._llm_override: Optional[List[int]] = None
+        self._llm_override_steps_left: int = 0
+
+        # ── Anti-freeze exploration prior ─────────────────────────────────────
+        # The (sim-trained) policy frequently picks "stop", which leaves Leon
+        # standing still in the open until the village mob encircles him.  When
+        # no enemies are visible and the policy idles, nudge him to keep walking
+        # and sweeping the camera so he actually traverses the village toward the
+        # shotgun house / bell.  Toggle off via config to train pure RL.
+        self._anti_freeze: bool = bool(
+            rl_cfg.get("anti_freeze_explore", True)
+        )
+        self._explore_tick: int = 0
 
         # Curriculum
         self._curriculum_stage: str = self._cfg["curriculum"].get("initial_stage", "exploration")
 
+        # ── Curriculum weights: config-driven with hardcoded fallback ─────────
+        # Merge order per stage: hardcoded defaults ← config reward_weights.
+        # This honours config.yaml's contract that reward tuning lives there.
+        # Example: setting curriculum.stages.combat.reward_weights.combat: 4.0
+        # in config.yaml now actually changes the combat-stage reward emphasis.
+        self._curriculum_weights: Dict[str, Dict[str, float]] = {
+            name: dict(w) for name, w in _CURRICULUM_WEIGHTS.items()
+        }
+        for _stage, _scfg in self._cfg["curriculum"].get("stages", {}).items():
+            _rw = (_scfg or {}).get("reward_weights")
+            if _rw:
+                base = self._curriculum_weights.setdefault(
+                    _stage, dict(_CURRICULUM_WEIGHTS["exploration"])
+                )
+                base.update({k: float(v) for k, v in _rw.items()})
+        logger.info("Curriculum reward weights in effect: %s", self._curriculum_weights)
+
+        # Reward computation lives in env.rewards.RewardCalculator.
+        self._rewards = RewardCalculator(self._curriculum_weights)
+        self._rewards.set_stage(self._curriculum_stage)
+
         # ── Episode state (reset in reset()) ──────────────────────────────────
-        self._prev_health:       float      = 1.0
-        self._prev_ammo_clip:    int        = 0
-        self._prev_ammo_res:     int        = 0
-        self._prev_enemy_labels: List[str]  = []
+        # Health/ammo/enemy bookkeeping lives in the DeathDetector and
+        # RewardCalculator modules; the env keeps only orchestration state.
         self._episode_step:      int        = 0
         self._episode_start:     float      = time.time()
         self._death_count:       int        = 0
@@ -147,9 +257,6 @@ class ResidentEvilEnv(gym.Env):
         # tries different approaches and learns which works best.
         self._recent_mv_actions: deque = deque(maxlen=_DIVERSITY_WINDOW)
 
-        # Item pickup tracking — detect ammo/health increases as proxy for pickup
-        self._prev_health_for_pickup: float = 1.0
-
         logger.info(
             "ResidentEvilEnv initialised (obs %dx%d %s x%d-stack, stage=%s)",
             h, w,
@@ -161,8 +268,9 @@ class ResidentEvilEnv(gym.Env):
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def set_curriculum_stage(self, stage: str) -> None:
-        if stage in _CURRICULUM_WEIGHTS:
+        if stage in self._curriculum_weights:
             self._curriculum_stage = stage
+            self._rewards.set_stage(stage)
             logger.info("Curriculum stage → %s", stage)
 
     def reset(
@@ -174,21 +282,45 @@ class ResidentEvilEnv(gym.Env):
         loading_wait = float(reset_cfg.get("loading_wait", 8.0))
 
         logger.debug("Resetting environment…")
+        # Clear any open pause-menu sub-screens before navigating Load Game.
+        self._ctrl.escape_to_gameplay()
         self._ctrl.reset_game(reset_cfg)
         time.sleep(loading_wait)
 
-        # Clear frame buffer — padding zeros will fill the stack until real frames arrive
-        self._frame_buffer.clear()
+        # Clear the frame buffer (module) — padding refills until real frames arrive
+        self._obs_builder.reset()
+
+        # Clear perception's per-episode buffers (health smoothing, ammo cache)
+        # so stale low readings from the last episode can't re-trigger a death.
+        if hasattr(self._eyes, "reset_state"):
+            self._eyes.reset_state()
 
         frame = self._cap.get_frame()
-        hud   = self._eyes.read_hud(frame)
+        # Serialized synchronous read (shares the worker's lock — YOLO/EasyOCR
+        # are not thread-safe, so no direct self._eyes calls from this thread).
+        hud   = self._perception_worker.read_sync(frame)[1]
+
+        # Seed the perception cache with this fresh read so the first steps have
+        # valid detections/HUD before the throttle interval elapses.
+        self._cached_hud        = hud
+        self._cached_detections = []
+        self._last_perception_t = time.time()
 
         # Reset all episode state
-        self._prev_health            = float(hud.get("health_pct", 1.0))
-        self._prev_health_for_pickup = self._prev_health
-        self._prev_ammo_clip         = int(hud.get("ammo_clip", 0) or 0)
-        self._prev_ammo_res          = int(hud.get("ammo_res", 0) or 0)
-        self._prev_enemy_labels      = []
+        self._cached_death_screen    = False
+        self._perception_fresh       = False
+        self._last_enemy_seen_t      = 0.0
+        self._llm_steering           = False
+        _seed_h = float(hud.get("health_pct", 1.0) or 0.0)
+        # If the very first read is a bogus 0, assume full health rather than
+        # starting the episode "already dying".
+        seed_health = _seed_h if _seed_h > 0.0 else 1.0
+        self._death.reset(prev_health=seed_health)
+        self._rewards.reset(
+            health=seed_health,
+            ammo_clip=int(hud.get("ammo_clip", 0) or 0),
+            ammo_res=int(hud.get("ammo_res", 0) or 0),
+        )
         self._episode_step           = 0
         self._episode_start          = time.time()
         self._in_combat              = False
@@ -200,7 +332,13 @@ class ResidentEvilEnv(gym.Env):
         self._last_inv_time          = 0.0
         self._recent_mv_actions.clear()
 
-        obs = self._build_obs(frame, hud, detections=[])
+        obs = self._obs_builder.build(
+            frame, hud, [],
+            prev_health=self._death.prev_health,
+            prev_ammo_clip=self._rewards.prev_ammo_clip,
+            in_combat=False,
+            episode_start=self._episode_start,
+        )
         self._shared.update(
             frame=frame,
             hud=hud,
@@ -213,14 +351,26 @@ class ResidentEvilEnv(gym.Env):
     def step(self, action: np.ndarray) -> Tuple[Dict, float, bool, bool, Dict]:
         action = list(action)
 
-        # ── LLM action override ───────────────────────────────────────────────
-        # If Claude has recommended a specific action this step, use it instead
-        # of the RL policy's choice.  The override is cleared immediately after
-        # use so it only applies for a single step.
+        # ── LLM action override (held for several steps) ──────────────────────
+        # If Claude has recommended a specific action, latch it and re-apply it
+        # for `override_hold_steps` steps so its navigation actually moves Leon
+        # (a one-step override evaporates in 0.04 s and steers nothing).
         override = self._shared.llm_action_override
         if override is not None:
-            action = override
+            self._llm_override = list(override)
+            self._llm_override_steps_left = self._override_hold
             self._shared.update(llm_action_override=None)
+
+        self._llm_steering = (
+            self._llm_override_steps_left > 0 and self._llm_override is not None
+        )
+        if self._llm_steering:
+            # Claude is actively steering — follow it, don't second-guess.
+            action = list(self._llm_override)
+            self._llm_override_steps_left -= 1
+        elif self._anti_freeze:
+            # No LLM steering this step — break any idle freeze so Leon explores.
+            action = self._maybe_explore(action)
 
         # ── Execute action ────────────────────────────────────────────────────
         self._last_mv_action  = action[0]
@@ -235,12 +385,38 @@ class ResidentEvilEnv(gym.Env):
         frame      = self._cap.get_frame()
         if frame.size == 0:
             frame  = np.zeros((self._obs_h, self._obs_w, 3), dtype=np.uint8)
-        detections = self._eyes.detect_objects(frame)
-        hud        = self._eyes.read_hud(frame)
+
+        # Perception now runs on the dedicated worker thread and lands in
+        # SharedState; adopt the newest snapshot instead of running YOLO/OCR
+        # inline.  The frame itself is always fresh (threaded ScreenCapture).
+        # Synchronous fallback covers the startup steps before the worker's
+        # first publish (perception_at == 0.0).
+        now = time.time()
+        if self._shared.perception_at > self._last_perception_t:
+            self._cached_detections   = list(self._shared.detections)
+            self._cached_hud          = dict(self._shared.hud)
+            self._cached_death_screen = bool(self._shared.death_screen)
+            self._last_perception_t   = self._shared.perception_at
+            self._perception_fresh    = True
+        elif self._shared.perception_at == 0.0 and now - self._last_perception_t >= self._perception_interval:
+            # Worker hasn't published yet (startup) — one serialized sync read.
+            dets, hud_now, death      = self._perception_worker.read_sync(frame)
+            self._cached_detections   = dets
+            self._cached_hud          = hud_now
+            self._cached_death_screen = death
+            self._last_perception_t   = now
+            self._perception_fresh    = True
+        else:
+            # Cached data — death/health streaks must not advance on repeats.
+            self._perception_fresh = False
+        detections = self._cached_detections
+        hud        = self._cached_hud
         enemy_labels = [
             d["label"] for d in detections
             if d["label"] in ("person", "zombie", "enemy")
         ]
+        if enemy_labels:
+            self._last_enemy_seen_t = now
 
         # ── Build observation BEFORE reward ───────────────────────────────────
         # IMPORTANT: obs must be built before _calculate_reward() because the
@@ -248,10 +424,43 @@ class ResidentEvilEnv(gym.Env):
         # If we built obs after that update, `ammo_delta_norm` in the HUD vector
         # would always be zero (curr - curr = 0) — ammo-waste tracking broken.
         # Analogy: read the fuel gauge before you top up the tank, not after.
-        obs = self._build_obs(frame, hud, detections)
+        obs = self._obs_builder.build(
+            frame, hud, detections,
+            prev_health=self._death.prev_health,
+            prev_ammo_clip=self._rewards.prev_ammo_clip,
+            in_combat=self._in_combat,
+            episode_start=self._episode_start,
+        )
 
         # ── Reward & termination ──────────────────────────────────────────────
-        reward, terminated = self._calculate_reward(hud, enemy_labels)
+        verdict = self._death.update(
+            raw_health=hud.get("health_pct", None),
+            death_screen=self._cached_death_screen,
+            perception_fresh=self._perception_fresh,
+            episode_step=self._episode_step,
+        )
+        terminated = verdict.died
+        if terminated:
+            self._death_count += 1
+            # Push the running total to SharedState so the dashboard's death
+            # stat actually moves.
+            self._shared.update(death_count=self._death_count)
+            logger.info("Death detected (%s) — ending episode.", verdict.cause)
+
+        reward = self._rewards.compute(RewardInputs(
+            hud=hud,
+            enemy_labels=enemy_labels,
+            died=verdict.died,
+            health=verdict.health,
+            health_valid=verdict.health_valid,
+            damage_taken=verdict.damage_taken,
+            last_comb_action=self._last_comb_action,
+            was_aiming=self._was_aiming,
+            inv_opened=self._inv_opened_step,
+            last_mv_action=self._last_mv_action,
+            recent_mv_actions=list(self._recent_mv_actions),
+            llm_objective=self._shared.llm_objective or "",
+        ))
         self._total_episode_reward += reward
 
         # Time-based truncation (10-minute hard cap)
@@ -270,11 +479,18 @@ class ResidentEvilEnv(gym.Env):
         info = {**hud, "detections": detections, "episode_step": self._episode_step}
 
         if terminated or truncated:
+            # NOTE: SB3's Monitor wrapper OVERWRITES info["episode"] with its own
+            # {"r","l","t"} dict on episode end, so any custom keys placed inside
+            # it (like "deaths") never survive to the callbacks.  We therefore
+            # also expose deaths as a TOP-LEVEL info key, which Monitor leaves
+            # untouched.  Analogy: don't put your note inside an envelope the
+            # post office is going to replace — tape it to the outside of the box.
             info["episode"] = {
                 "r":      self._total_episode_reward,
                 "l":      self._episode_length,
                 "deaths": self._death_count,
             }
+            info["death_count"] = self._death_count
 
         return obs, reward, terminated, truncated, info
 
@@ -284,291 +500,97 @@ class ResidentEvilEnv(gym.Env):
 
     # ── Private helpers ────────────────────────────────────────────────────────
 
-    def _build_obs(
-        self,
-        frame: np.ndarray,
-        hud: Dict,
-        detections: List[Dict],
-    ) -> Dict[str, np.ndarray]:
+    def _maybe_explore(self, action: List[int]) -> List[int]:
         """
-        Build the observation dict:
-          "frame" — stacked frames (H, W, C×N_stack)
-          "hud"   — 7-element normalised sensor vector
+        Anti-freeze exploration prior.
 
-        FRAME STACKING EXPLAINED:
-          We maintain a rolling buffer of the last N frames.  Each call to
-          _build_obs appends the current frame and pops the oldest.  The buffer
-          is concatenated along the channel axis:
-            stack=4, grayscale:  (84, 84, 1) × 4  →  (84, 84, 4)
-            stack=4, RGB:        (84, 84, 3) × 4  →  (84, 84, 12)
-          The CNN sees all 4 frames simultaneously and can detect motion
-          (enemy moving between frames = different pixel values).
-          Padding: while the buffer fills up in the first N steps of an episode,
-          we pad with the earliest available frame repeated.
+        Problem: the policy often selects mv=0 (stop).  With no enemies nearby
+        that just leaves Leon standing in the open until the village crowd closes
+        in — the agent looks "stuck" and never reaches the shotgun house or the
+        bell.  When it's safe (no enemies on the last frame) AND the policy chose
+        to stand still, we substitute an exploratory movement so he keeps making
+        ground.  This is a light, *varied* nudge (it changes heading and sweeps
+        the camera over time, occasionally sprints) rather than a fixed script,
+        and it only kicks in on idle-and-safe steps — whenever the policy actually
+        wants to move or fight, we leave its choice untouched.
         """
-        # --- Preprocess current frame ---
-        small = cv2.resize(frame, (self._obs_w, self._obs_h))
-        if self._grayscale:
-            small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)[:, :, np.newaxis]
-        else:
-            small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)   # (H, W, 3)
+        # Only intervene when it's safe and the policy is idling.  Uses the
+        # same time latch as the aim gate — a YOLO flicker mid-fight shouldn't
+        # count as "safe to wander off".
+        if (time.time() - self._last_enemy_seen_t) <= self._enemy_latch_s:
+            return action
+        mv, cam, inter, comb, ev, inv = action
+        if mv != 0:
+            return action
 
-        # Push into rolling buffer
-        self._frame_buffer.append(small)
-
-        # Pad with the first available frame if buffer not yet full
-        frames_to_stack = list(self._frame_buffer)
-        while len(frames_to_stack) < self._stack_size:
-            frames_to_stack.insert(0, frames_to_stack[0])
-
-        stacked = np.concatenate(frames_to_stack, axis=2)   # (H, W, C×N_stack)
-
-        # --- HUD vector (7 elements) ---
-        health    = float(hud.get("health_pct", 1.0))
-        clip_raw  = int(hud.get("ammo_clip", 0) or 0)
-        res_raw   = int(hud.get("ammo_res",  0) or 0)
-        clip_norm = min(clip_raw / _AMMO_CLIP_MAX, 1.0)
-        res_norm  = min(res_raw  / _AMMO_RES_MAX,  1.0)
-
-        n_enemies  = sum(1 for d in detections if d["label"] in ("person", "zombie", "enemy"))
-        enemy_norm = min(n_enemies / _ENEMY_MAX, 1.0)
-        in_combat  = 1.0 if self._in_combat else 0.0
-
-        elapsed   = (time.time() - self._episode_start) / _MAX_EPISODE_S
-        time_pres = min(elapsed, 1.0)
-
-        # Ammo delta — negative means shots fired this step (penalise ammo waste)
-        ammo_delta = clip_raw - self._prev_ammo_clip
-        ammo_delta_norm = max(min(ammo_delta / _AMMO_CLIP_MAX, 1.0), -1.0) * 0.5 + 0.5
-
-        hud_vec = np.array(
-            [health, clip_norm, res_norm, enemy_norm, in_combat, time_pres, ammo_delta_norm],
-            dtype=np.float32,
-        )
-        return {"frame": stacked, "hud": hud_vec}
+        self._explore_tick += 1
+        t = self._explore_tick
+        # Rotate heading every ~30 steps so we don't wall-hug one direction.
+        mv = {0: 1, 1: 6, 2: 1, 3: 5}[(t // 30) % 4]   # fwd / fwd-right / fwd / fwd-left
+        # Gentle camera sweep to scan for the route and approaching enemies.
+        if cam == 0:
+            cam = 2 if (t % 12) < 6 else 1             # alternate look right / left
+        # Sprint a fraction of the time to cover the village faster.
+        if ev == 0 and (t % 6 == 0):
+            ev = 2
+        return [mv, cam, inter, comb, ev, inv]
 
     def _take_action(self, action: List[int]) -> None:
         """
-        Map the discrete action indices to actual game inputs via GameControls.
+        Translate discrete action indices into a single atomic gamepad update.
 
-        TWO GUARDS before any input is sent:
+        Guard: if shared.paused is True (dashboard Pause button, or auto-pause
+        when the focus monitor detects RE4 lost foreground), all axes are zeroed
+        and the step is skipped.  The RL training loop still ticks so episode
+        state is consistent, but nothing reaches the game.
 
-        1. paused flag — set by the dashboard Pause button or automatically when
-           the game window loses focus.  While paused, ALL inputs are blocked and
-           any held keys/buttons are released.  The RL training loop keeps ticking
-           (steps count up, rewards compute) but nothing touches the game or the
-           browser the user is interacting with.
-
-        2. is_game_focused() — final OS-level check.  Even if paused=False, if
-           RE4 has somehow lost focus (e.g. a popup appeared), we block inputs.
-
-        Analogy: paused is like a bouncer at the door of the input pipeline.
-        is_game_focused() is the second bouncer right before the game window.
-        Both have to say "yes" before a keystroke gets in.
+        With the virtual gamepad backend, window focus is NOT required for
+        training steps — inputs go directly to the XInput device layer.
         """
-        # Guard 1 — explicit pause (dashboard button or auto-focus-loss)
         if self._shared.paused:
-            self._ctrl.release_all()   # ensure no keys are stuck held
-            return                     # silently skip — no warning spam in logs
-
-        # Guard 2 — OS foreground focus check
-        if not self._ctrl.is_game_focused():
             self._ctrl.release_all()
-            logger.warning("Game window lost focus — skipping action, releasing held keys")
-            self._shared.update(game_focused=False)
             return
-        self._shared.update(game_focused=True)
 
         mv, cam, inter, comb, ev, inv = action
 
+        # ── Aim/shoot gate ────────────────────────────────────────────────────
+        # The sim-trained policy tends to hold aim+shoot (combat=3) almost every
+        # step.  In RE4 holding aim (LT) ROOTS Leon — he raises the gun and can
+        # only shuffle, so a constant-aim policy looks frozen and never explores.
+        # Heuristic fix: only permit aim/shoot when an enemy has been seen
+        # RECENTLY (time latch, not just the previous frame — YOLO flickers,
+        # and a single missed detection used to strobe combat off mid-fight).
+        # Claude's explicit overrides bypass the gate entirely: if the advisor
+        # says aim, it can see something YOLO can't.
+        enemy_recent = (time.time() - self._last_enemy_seen_t) <= self._enemy_latch_s
+        if comb in (1, 2, 3) and not enemy_recent and not self._llm_steering:
+            comb = 0
+
         self._inv_opened_step = False
 
-        # ── Movement ─────────────────────────────────────────────────────────
-        _MOVE = {
-            1: "fwd",      2: "back",      3: "left",       4: "right",
-            5: "fwd_left", 6: "fwd_right", 7: "back_left",  8: "back_right",
-        }
-        if mv in _MOVE:
-            self._ctrl.move(_MOVE[mv], duration=self._action_hold)
-
-        # ── Camera ────────────────────────────────────────────────────────────
-        _CAM = {1: (-25, 0), 2: (25, 0), 3: (0, -20), 4: (0, 20)}
-        if cam in _CAM:
-            self._ctrl.look(*_CAM[cam])
-
-        # ── Combat ────────────────────────────────────────────────────────────
-        # RE4 scheme: hold right-click to aim, left-click to shoot
-        # The correct combo is: aim first (build accuracy), then shoot.
-        if comb == 1:
-            self._ctrl.combat("aim")          # hold RMB — entering aim stance
-            self._in_combat = True
-            self._was_aiming = True
-        elif comb == 2:
-            self._ctrl.combat("shoot")        # click LMB — hip-fire
-            self._in_combat = True
-        elif comb == 3:
-            self._ctrl.combat("aim")          # RMB + LMB in one step = aimed shot
-            self._ctrl.combat("shoot")
-            self._in_combat = True
-            self._was_aiming = True
-        else:
-            self._ctrl.combat("stop_aim")     # release RMB — lower weapon
-            self._in_combat = False
-            self._was_aiming = False
-
-        # ── Interact ──────────────────────────────────────────────────────────
-        if inter == 1:
-            self._ctrl.interact()
-
-        # ── Evasion ───────────────────────────────────────────────────────────
-        if ev == 1:
-            self._ctrl.evade(sprint=False)
-        elif ev == 2:
-            self._ctrl.evade(sprint=True)
-
-        # ── Inventory ─────────────────────────────────────────────────────────
+        # Inventory cooldown check (prevent Tab-spam mid-fight)
+        effective_inv = 0
         if inv == 1:
             now = time.time()
             if now - self._last_inv_time >= self._inv_cooldown:
-                self._ctrl.inventory()
+                effective_inv = 1
                 self._last_inv_time = now
                 self._inv_opened_step = True
 
-    def _calculate_reward(
-        self,
-        hud: Dict,
-        enemy_labels: List[str],
-    ) -> Tuple[float, bool]:
-        """
-        Reward function for the RE4 village setting.
-
-        Components (weighted by curriculum stage):
-        ┌─────────────────┬──────────────────────────────────────────────────┐
-        │ survival_r      │ +0.1/step alive; proportional penalty for damage;│
-        │                 │ large death penalty                               │
-        ├─────────────────┼──────────────────────────────────────────────────┤
-        │ combat_r        │ enemy kills; aimed shots; leg-shot bonus;        │
-        │                 │ penalise hip-fire; penalise ammo waste            │
-        ├─────────────────┼──────────────────────────────────────────────────┤
-        │ exploration_r   │ movement diversity (unique actions/window);      │
-        │                 │ penalty for standing still                        │
-        ├─────────────────┼──────────────────────────────────────────────────┤
-        │ item_pickup_r   │ ammo reserve increase → item pickup proxy        │
-        │                 │ health increase → herb use proxy                  │
-        ├─────────────────┼──────────────────────────────────────────────────┤
-        │ objective_r     │ LLM-set objective bonus (if active)              │
-        └─────────────────┴──────────────────────────────────────────────────┘
-        """
-        weights    = _CURRICULUM_WEIGHTS.get(self._curriculum_stage, _CURRICULUM_WEIGHTS["exploration"])
-        terminated = False
-
-        # ── 1. Survival ───────────────────────────────────────────────────────
-        curr_health = float(hud.get("health_pct", 0.0))
-        survival_r  = 0.1   # per-step alive bonus
-
-        if curr_health < self._prev_health:
-            delta = self._prev_health - curr_health
-            # Proportional damage penalty — losing 50% health = -2.5 pts
-            survival_r -= 5.0 * delta
-
-        if curr_health <= 0.05:
-            # Death: large penalty + episode termination
-            survival_r -= 20.0
-            self._death_count += 1
-            terminated = True
-
-        # Village-specific: extra penalty for being at critical health (red ring)
-        # At this point the agent must prioritise herbs immediately
-        if curr_health < 0.2:
-            survival_r -= 0.3   # "danger" zone — hurry up and heal
-
-        self._prev_health = curr_health
-
-        # ── 2. Combat ─────────────────────────────────────────────────────────
-        n_now    = len(enemy_labels)
-        n_was    = len(self._prev_enemy_labels)
-        killed   = max(0, n_was - n_now)
-        combat_r = 0.5 * n_now          # reward for being in an active fight
-        combat_r += 3.0 * killed        # strong kill bonus (up from 2.0)
-
-        comb = self._last_comb_action
-        if n_now > 0:
-            if comb == 3:
-                # Aimed shot at a visible enemy — the ideal RE4 technique
-                combat_r += 2.0
-            elif comb == 1:
-                # Holding aim at enemies — good discipline
-                combat_r += 0.5
-            elif comb == 2 and not self._was_aiming:
-                # Hip-fire without aiming — inaccurate in RE4; discourage it
-                # Exception: at very close range hip-fire is valid
-                combat_r -= 1.0
-
-        # Inventory mid-combat = extremely bad (Leon freezes, can't dodge)
-        if self._inv_opened_step and n_now > 0:
-            combat_r -= 5.0
-
-        # Ammo discipline — small penalty per bullet fired
-        curr_clip   = int(hud.get("ammo_clip", 0) or 0)
-        ammo_delta  = self._prev_ammo_clip - curr_clip
-        if ammo_delta > 0:
-            combat_r -= 0.1 * ammo_delta     # 10 shots fired = -1.0 pts
-        self._prev_ammo_clip = curr_clip
-
-        self._prev_enemy_labels = enemy_labels
-
-        # ── 3. Exploration / movement diversity ───────────────────────────────
-        # Penalise standing still (the village mob encircles a stationary Leon).
-        # Additionally, reward movement VARIETY — using many different directions
-        # instead of just running in circles.
-        mv_action = getattr(self, "_last_mv_action", 0)
-
-        if mv_action == 0:
-            # Standing still — strong penalty (especially in village crowds)
-            exploration_r = -0.05
+        # Track combat state for reward calculation
+        if comb in (1, 3):
+            self._in_combat = True
+            self._was_aiming = True
+        elif comb == 2:
+            self._in_combat = True
         else:
-            # Alive and moving — small baseline reward
-            exploration_r = 0.05
-            # Diversity bonus: what fraction of recent actions were unique?
-            if len(self._recent_mv_actions) >= 5:
-                unique_moves   = len(set(self._recent_mv_actions))
-                diversity_frac = unique_moves / len(set(range(1, 9)))   # out of 8 directions
-                # Scale 0→0.2 bonus based on movement variety
-                exploration_r += 0.2 * diversity_frac
+            self._in_combat = False
+            self._was_aiming = False
 
-        # ── 4. Item pickup proxy ──────────────────────────────────────────────
-        # We can't directly detect "Leon picked up the shotgun", but we CAN
-        # detect: ammo reserve increased (ammo pickup) or health increased (herb).
-        curr_res = int(hud.get("ammo_res", 0) or 0)
-        item_r   = 0.0
-
-        if curr_res > self._prev_ammo_res:
-            # Ammo reserve went up → picked up ammo or the shotgun (big reward!)
-            delta_res = curr_res - self._prev_ammo_res
-            item_r   += 2.0 * min(delta_res / 10.0, 3.0)   # up to +6.0 per big pickup
-
-        if curr_health > self._prev_health_for_pickup + 0.05:
-            # Health went up → used a herb  (only count meaningful increases)
-            item_r += 1.0
-
-        self._prev_ammo_res          = curr_res
-        self._prev_health_for_pickup = curr_health
-
-        # ── 5. LLM objective shaping ──────────────────────────────────────────
-        # The Claude advisor sets a short phrase as the active objective.
-        # We give a small per-step bonus while any objective is set, to guide
-        # the exploration curriculum.
-        objective_r = 0.5 if self._shared.llm_objective else 0.0
-
-        # ── Weighted sum ──────────────────────────────────────────────────────
-        reward = (
-            weights["survival"]    * survival_r
-            + weights["combat"]    * combat_r
-            + weights["exploration"] * (exploration_r + item_r)
-            + weights["objective"]   * objective_r
-        )
-
-        return float(reward), terminated
+        # Single atomic gamepad update — all six dimensions applied at once,
+        # held for action_hold_seconds, then returned to neutral.
+        self._ctrl.execute_step(mv, cam, inter, comb, ev, effective_inv,
+                                hold=self._action_hold)
 
 
 # ── Standalone test ───────────────────────────────────────────────────────────
