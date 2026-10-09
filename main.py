@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
 def _failsafe_watchdog(shared: SharedState) -> None:
     """
     Polls mouse position at 20 Hz and stops the agent if the cursor reaches
-    the top-left corner of the virtual desktop (covers all monitors).
+    any corner of the virtual desktop (covers all monitors).
 
     Why virtual desktop bounds instead of pyautogui.size()?
     pyautogui.size() returns only the PRIMARY monitor dimensions. On a
