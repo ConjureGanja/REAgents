@@ -130,12 +130,7 @@ class SimDashboardCallback(BaseCallback):
                 self._ep_rewards[i] = 0.0
                 self._ep_lengths[i] = 0
 
-                # Track episode count per worker (safe access)
-                self._shared.update_worker(
-                    worker_id=i,
-                    snapshot=info.get("sim_snapshot", {}),
-                    reward=self._ep_rewards[i],
-                )
+                # Episode count is tracked below; keep last worker snapshot/reward intact.
                 # Also increment episode counter safely via SharedState
                 with self._shared._lock:
                     while len(self._shared.worker_episodes) <= i:
