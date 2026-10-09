@@ -67,8 +67,8 @@ def _failsafe_watchdog(shared: SharedState) -> None:
     width, so any mouse position on monitor 2 would falsely trigger the
     right-edge check (x >= sw - 3). We use SM_CXVIRTUALSCREEN / SM_XVIRTUALSCREEN
     to get the true bounds of the full desktop across all monitors, and only
-    check the top-left corner so the right/bottom edges of monitor 1 (which are
-    the middle of the desktop) never fire.
+    trigger on *corners* (not edges) so normal use of the primary monitor's
+    right/bottom edges doesn't fire the failsafe.
     """
     import ctypes
     import pyautogui
