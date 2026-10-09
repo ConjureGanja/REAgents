@@ -189,7 +189,7 @@ WALKTHROUGH: dict = {
 GENERAL_TIPS: list[str] = [
     "Knife parrying saves enormous ammo — tap knife (LB+RB quickly) at the last second before a melee hit. Works on almost every enemy melee attack.",
     "Shoot enemy LEGS to trip them, then run up and press melee (A or X) for a free kick — zero ammo cost, significant damage.",
-    "Sprint (L31) away from crowds rather than shooting — conserve ammo for the shotgun house run.",
+    "Sprint (hold B) away from crowds rather than shooting — conserve ammo for the shotgun house run.",
     "Combine treasures with matching coloured gems (5 gems = maximum value multiplier — never sell unmatched gems).",
     "Flash grenades instantly kill exposed Plagas parasites — extremely efficient (one grenade = multiple kills).",
     "Always buy a Rocket Launcher before Verdugo and Saddler fights; saves minutes of frustrating combat.",
